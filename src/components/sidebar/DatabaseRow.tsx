@@ -1,7 +1,10 @@
+import { useCallback, useState } from "react";
+import type { MouseEvent } from "react";
 import { ChevronRight, Layers } from "lucide-react";
-import { selectActiveTab, useSessionsStore } from "../../store/sessionsStore";
+import { databaseKey, selectActiveTab, useSessionsStore } from "../../store/sessionsStore";
 import type { TabConnection } from "../../store/sessionsStore";
 import type { CollectionInfo, DatabaseInfo } from "../../types/connection";
+import { ContextMenu } from "../ui/ContextMenu";
 
 // The active connection already paints its whole subtree bg-sidebar-active,
 // so the open collection can't reuse that colour. A wash of the text colour
@@ -29,27 +32,41 @@ interface DatabaseRowProps {
   connection: TabConnection;
   /** The sidebar search, lowercased. */
   query: string;
-  /** This database's collections matching the search, when some do. */
+  /** This database's collections matching the search, when some do; it opens to show them. */
   matches: CollectionInfo[] | null;
 }
 
 export function DatabaseRow({ db, sessionId, connection, query, matches }: DatabaseRowProps) {
-  const expandedDatabase = useSessionsStore((s) => s.expandedDatabase);
-  const collections = useSessionsStore((s) => s.collections);
-  const collectionsLoading = useSessionsStore((s) => s.collectionsLoading);
-  const collectionsError = useSessionsStore((s) => s.collectionsError);
+  const tree = useSessionsStore((s) => s.databaseTree[databaseKey(connection.id, db.name)]);
   // Strings, not the tab object, so typing in a query doesn't re-render the tree.
   const activeConnectionId = useSessionsStore(
     (s) => selectActiveTab(s)?.connection.id ?? null,
   );
   const activeDatabase = useSessionsStore((s) => selectActiveTab(s)?.database ?? null);
-  const activeTabCollection = useSessionsStore(
-    (s) => selectActiveTab(s)?.collection ?? null,
-  );
+  // a console tab's collection is only where it started, not what it shows
+  const activeTabCollection = useSessionsStore((s) => {
+    const tab = selectActiveTab(s);
+    return tab?.kind === "collection" ? tab.collection : null;
+  });
   const toggleDatabase = useSessionsStore((s) => s.toggleDatabase);
   const openCollection = useSessionsStore((s) => s.openCollection);
+  const openConsole = useSessionsStore((s) => s.openConsole);
+  // Right-click menu, on the database row or one of its collections.
+  const [menu, setMenu] = useState<{ x: number; y: number; collection: string | null } | null>(
+    null,
+  );
+  const closeMenu = useCallback(() => setMenu(null), []);
 
-  const isOpen = expandedDatabase === db.name;
+  function openMenu(e: MouseEvent, collection: string | null) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, collection });
+  }
+
+  const isOpen = (tree?.expanded ?? false) || matches !== null;
+  const collections = tree?.collections ?? [];
+  const collectionsLoading = tree?.loading ?? false;
+  const collectionsError = tree?.error ?? null;
   // Collapsing is only visual, so surface the active tab's collection on the
   // database row itself - otherwise it disappears from the sidebar.
   const activeCollection =
@@ -65,7 +82,8 @@ export function DatabaseRow({ db, sessionId, connection, query, matches }: Datab
         className={`flex w-full items-center gap-1.5 px-1.5 py-1 text-left text-xs text-text-default ${
           showsActiveInline ? activeRowClass : "hover:bg-sidebar-hover"
         }`}
-        onClick={() => toggleDatabase(sessionId, db.name)}
+        onClick={() => toggleDatabase(connection.id, sessionId, db.name)}
+        onContextMenu={(e) => openMenu(e, null)}
       >
         <ChevronRight
           size={12}
@@ -102,11 +120,39 @@ export function DatabaseRow({ db, sessionId, connection, query, matches }: Datab
               }`}
               title={coll.name}
               onClick={() => openCollection(sessionId, connection, db.name, coll.name)}
+              onContextMenu={(e) => openMenu(e, coll.name)}
             >
               {matches ? <Highlighted name={coll.name} query={query} /> : coll.name}
             </button>
           ))}
         </div>
+      )}
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={closeMenu}
+          items={
+            menu.collection === null
+              ? [
+                  {
+                    label: `Open console on ${db.name}`,
+                    onSelect: () => openConsole(connection, db.name, null),
+                  },
+                ]
+              : [
+                  {
+                    label: "Open collection",
+                    onSelect: () =>
+                      openCollection(sessionId, connection, db.name, menu.collection!),
+                  },
+                  {
+                    label: `Open console on ${db.name}`,
+                    onSelect: () => openConsole(connection, db.name, menu.collection),
+                  },
+                ]
+          }
+        />
       )}
     </div>
   );

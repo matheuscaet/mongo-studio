@@ -28,7 +28,7 @@ function currentQuery(
 }
 
 export function ExportDialog({ tab, onClose }: ExportDialogProps) {
-  const session = useConnectionsStore((st) => st.session);
+  const session = useConnectionsStore((st) => st.sessions[tab.connection.id]);
   const { database: selectedDatabase, collection: selectedCollection, mode, limit } = tab;
   const { running, rowsWritten, summary, error, start, cancel, reset } = useExportStore();
   const [nestedMode, setNestedMode] = useState<ExportNestedMode>("flatten");

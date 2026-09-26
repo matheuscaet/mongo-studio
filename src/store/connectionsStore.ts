@@ -9,7 +9,7 @@ import type {
   SecretBackendInfo,
 } from "../types/connection";
 
-interface ActiveSession {
+export interface ActiveSession {
   connectionId: string;
   sessionId: string;
   serverVersion: string | null;
@@ -22,7 +22,12 @@ interface ConnectionsState {
   profilesLoaded: boolean;
   loading: boolean;
   error: string | null;
-  session: ActiveSession | null;
+  /** Live sessions by connection id - any number of servers at once. */
+  sessions: Record<string, ActiveSession>;
+  /** Connections whose connect is in flight. */
+  connecting: Record<string, true>;
+  /** Why the last connect of a connection failed, shown on its row. */
+  connectErrors: Record<string, string>;
   secretBackend: SecretBackendInfo | null;
   lastTestResult: ConnectionTestResult | null;
 
@@ -31,8 +36,21 @@ interface ConnectionsState {
   saveProfile: (input: ConnectionProfileInput) => Promise<void>;
   deleteProfile: (id: string) => Promise<void>;
   testConnection: (input: ConnectionProfileInput) => Promise<void>;
+  /** Opens a session for the connection, alongside any already open. */
   connect: (id: string) => Promise<void>;
-  disconnect: () => Promise<void>;
+  /** Ends the connection's session and closes its tabs. */
+  disconnect: (id: string) => Promise<void>;
+}
+
+/** The live session id for a connection, read at call time. */
+export function sessionIdFor(connectionId: string): string | null {
+  return useConnectionsStore.getState().sessions[connectionId]?.sessionId ?? null;
+}
+
+function without<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...record };
+  delete next[key];
+  return next;
 }
 
 export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
@@ -40,7 +58,9 @@ export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
   profilesLoaded: false,
   loading: false,
   error: null,
-  session: null,
+  sessions: {},
+  connecting: {},
+  connectErrors: {},
   secretBackend: null,
   lastTestResult: null,
 
@@ -76,7 +96,7 @@ export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
 
   deleteProfile: async (id) => {
     // Deleting the connection in use would leave a session nothing points to.
-    if (get().session?.connectionId === id) await get().disconnect();
+    if (get().sessions[id]) await get().disconnect(id);
     set({ loading: true, error: null });
     try {
       await api.deleteConnectionProfile(id);
@@ -97,44 +117,42 @@ export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
   },
 
   connect: async (id) => {
-    const current = get().session;
-    if (current && current.connectionId !== id) {
-      try {
-        await api.disconnect(current.sessionId);
-      } catch {
-        // best-effort - proceed to connect the new profile regardless
-      }
-      useSessionsStore.getState().reset();
-      set({ session: null });
-    }
-    set({ loading: true, error: null });
+    if (get().sessions[id] || get().connecting[id]) return;
+    set((s) => ({
+      connecting: { ...s.connecting, [id]: true },
+      connectErrors: without(s.connectErrors, id),
+    }));
     try {
       const handle = await api.connect(id);
       const databases = await api.listDatabases(handle.sessionId);
-      set({
-        session: {
-          connectionId: id,
-          sessionId: handle.sessionId,
-          serverVersion: handle.serverVersion,
-          databases,
+      set((s) => ({
+        sessions: {
+          ...s.sessions,
+          [id]: {
+            connectionId: id,
+            sessionId: handle.sessionId,
+            serverVersion: handle.serverVersion,
+            databases,
+          },
         },
-        loading: false,
-      });
+      }));
     } catch (e) {
-      set({ error: String(e), loading: false });
+      set((s) => ({ connectErrors: { ...s.connectErrors, [id]: String(e) } }));
+    } finally {
+      set((s) => ({ connecting: without(s.connecting, id) }));
     }
   },
 
-  disconnect: async () => {
-    const session = get().session;
+  disconnect: async (id) => {
+    const session = get().sessions[id];
     if (!session) return;
-    set({ loading: true, error: null });
+    // Close its tabs first: nothing should run on a session that's going.
+    useSessionsStore.getState().closeConnection(id);
+    set((s) => ({ sessions: without(s.sessions, id) }));
     try {
       await api.disconnect(session.sessionId);
-      useSessionsStore.getState().reset();
-      set({ session: null, loading: false });
-    } catch (e) {
-      set({ error: String(e), loading: false });
+    } catch {
+      // best-effort - the session is gone from the app either way
     }
   },
 }));

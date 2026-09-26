@@ -2,48 +2,45 @@ import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/tauri";
 import { useConnectionsStore } from "./connectionsStore";
-import { selectActiveTab, selectCurrentDatabase, useSessionsStore } from "./sessionsStore";
+import { selectActiveTab, useSessionsStore } from "./sessionsStore";
 import type { ScriptLogEvent } from "../types/script";
 
-/** Key of the console used while no collection tab is open. */
-export const NO_TAB_CONSOLE = "";
-
-/** The script a console starts with, pointed at its own collection. */
-export function defaultScript(database: string | null, collection: string | null): string {
+/** The script a console starts with, pointed at its collection if it has one. */
+export function defaultScript(database: string, collection: string | null): string {
   const header = `// db.collection("name") gives you find/findOne/insertOne/updateOne/deleteOne/aggregate/countDocuments.
 // Top-level await is supported.`;
-  if (database && collection) {
+  if (collection) {
     return `// Console for ${database}.${collection} - runs against the "${database}" database.
 ${header}
 const docs = await db.collection(${JSON.stringify(collection)}).find({}, { limit: 20 });
 docs;
 `;
   }
-  return `// JS console - runs against the currently selected database.
+  return `// Console for the "${database}" database - any of its collections.
 ${header}
-const count = await db.collection("users").countDocuments({});
-count;
+// e.g. await db.collection("orders").find({}, { limit: 20 });
 `;
 }
 
 /**
- * The console on screen: the active tab's, scoped to its collection, or the
- * shared one while no tab is open - with its script, the default one until
- * edited. Read from the stores at call time, so it suits callbacks bound
- * once, like Monaco commands.
+ * The console on screen - the active tab's, whether a console tab or a
+ * collection's own - with its script, the default one until edited. Null
+ * without a tab. Read from the stores at call time, so it suits callbacks
+ * bound once, like Monaco commands.
  */
 export function currentConsoleTarget() {
-  const session = useConnectionsStore.getState().session;
-  const sessions = useSessionsStore.getState();
-  const tab = selectActiveTab(sessions);
-  const database = selectCurrentDatabase(sessions) ?? session?.databases[0]?.name ?? null;
-  const key = tab?.id ?? NO_TAB_CONSOLE;
-  const stored = useConsoleStore.getState().consoles[key]?.script;
+  const tab = selectActiveTab(useSessionsStore.getState());
+  if (!tab) return null;
+  const session = useConnectionsStore.getState().sessions[tab.connection.id] ?? null;
+  const untouched = defaultScript(tab.database, tab.collection);
+  const stored = useConsoleStore.getState().consoles[tab.id]?.script;
   return {
+    tab,
     session,
-    database,
-    key,
-    script: stored ?? defaultScript(database, tab?.collection ?? null),
+    database: tab.database,
+    key: tab.id,
+    untouched,
+    script: stored ?? untouched,
   };
 }
 
@@ -69,7 +66,7 @@ const blankSession: ConsoleSession = {
 };
 
 interface ConsoleState {
-  /** One console per collection tab, keyed by tab id, plus NO_TAB_CONSOLE. */
+  /** One console per tab, keyed by tab id. */
   consoles: Record<string, ConsoleSession>;
 
   setScript: (key: string, script: string) => void;
@@ -129,7 +126,7 @@ useSessionsStore.subscribe((state, prev) => {
   if (state.tabs === prev.tabs) return;
   const open = new Set(state.tabs.map((t) => t.id));
   const { consoles } = useConsoleStore.getState();
-  const stale = Object.keys(consoles).filter((k) => k !== NO_TAB_CONSOLE && !open.has(k));
+  const stale = Object.keys(consoles).filter((k) => !open.has(k));
   if (stale.length === 0) return;
   const kept = { ...consoles };
   for (const key of stale) delete kept[key];

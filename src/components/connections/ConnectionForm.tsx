@@ -39,7 +39,7 @@ export function ConnectionForm({ editing, onSaved, onCancel }: ConnectionFormPro
     editing ? profileToInput(editing) : newProfileInput(),
   );
   const editingActive = useConnectionsStore(
-    (s) => editing !== undefined && s.session?.connectionId === editing.id,
+    (s) => editing !== undefined && s.sessions[editing.id] !== undefined,
   );
   const [tab, setTab] = useState<ConnectionTab>("general");
   const { saveProfile, testConnection, lastTestResult, loading, error } =

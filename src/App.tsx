@@ -16,34 +16,38 @@ const tabLabels: Record<MainTab, string> = {
   console: "Console",
 };
 
-const emptyMessages: Record<Exclude<MainTab, "console">, string> = {
-  browse: "Select a collection to browse its documents",
-  indexes: "Select a collection to see its indexes",
-};
-
 function App() {
   useSuppressNativeContextMenu();
-  const session = useConnectionsStore((s) => s.session);
+  const sessions = useConnectionsStore((s) => s.sessions);
   const { mainTab, setMainTab } = useUiStore();
   const tabs = useSessionsStore((s) => s.tabs);
   const activeTab = useSessionsStore(selectActiveTab);
 
-  const view: MainTab = !session ? "browse" : mainTab;
+  const connected = Object.keys(sessions).length;
+  const view: MainTab = connected === 0 ? "browse" : mainTab;
+  // The status bar speaks for the active tab's server when there is one.
+  const activeSession = activeTab ? sessions[activeTab.connection.id] : undefined;
 
   return (
     <AppShell
       sidebar={<Sidebar />}
       statusBar={
         <span>
-          {session
-            ? `Connected${session.serverVersion ? ` · MongoDB ${session.serverVersion}` : ""}`
-            : "Not connected"}
+          {activeTab && activeSession
+            ? `Connected to ${activeTab.connection.name}${
+                activeSession.serverVersion ? ` · MongoDB ${activeSession.serverVersion}` : ""
+              }${connected > 1 ? ` · ${connected} connections open` : ""}`
+            : connected > 0
+              ? `${connected} connection${connected === 1 ? "" : "s"} open`
+              : "Not connected"}
         </span>
       }
     >
       <div className="flex h-full flex-col">
-        {session && <CollectionTabs />}
-        {session && (
+        {connected > 0 && <CollectionTabs />}
+        {/* Browse, Indexes and Console belong to a collection tab; a console
+            tab is only a console. */}
+        {activeTab?.kind === "collection" && (
           <div className="flex gap-1 border-b border-border-subtle bg-editor px-2 pt-1.5">
             {(["browse", "indexes", "console"] as const).map((t) => (
               <button
@@ -64,23 +68,30 @@ function App() {
         <div className="relative min-h-0 flex-1">
           {/* Every tab's grid stays mounted and only the active one shows, so
               switching back keeps its scroll position and expanded nodes. */}
-          {tabs.map((tab) => (
-            <div
-              key={tab.id}
-              className={`absolute inset-0 ${
-                view === "browse" && tab.id === activeTab?.id ? "" : "invisible"
-              }`}
-            >
-              <DocumentGrid tab={tab} />
-            </div>
-          ))}
-          {view === "indexes" && activeTab && (
+          {tabs.map(
+            (tab) =>
+              tab.kind === "collection" && (
+                <div
+                  key={tab.id}
+                  className={`absolute inset-0 ${
+                    view === "browse" && tab.id === activeTab?.id ? "" : "invisible"
+                  }`}
+                >
+                  <DocumentGrid tab={tab} />
+                </div>
+              ),
+          )}
+          {activeTab?.kind === "collection" && view === "indexes" && (
             <IndexesPanel key={activeTab.id} tab={activeTab} />
           )}
-          {view === "console" && <ScriptConsole />}
-          {view !== "console" && !activeTab && (
-            <div className="flex h-full items-center justify-center text-text-muted">
-              {emptyMessages[view]}
+          {activeTab && (activeTab.kind === "console" || view === "console") && (
+            <ScriptConsole tab={activeTab} />
+          )}
+          {!activeTab && (
+            <div className="flex h-full items-center justify-center px-6 text-center text-text-muted">
+              {connected > 0
+                ? "Open a collection, or right-click a database or collection to open a console on it"
+                : "Connect to a server to browse its collections"}
             </div>
           )}
         </div>

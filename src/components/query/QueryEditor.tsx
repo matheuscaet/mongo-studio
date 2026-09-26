@@ -4,6 +4,7 @@ import type * as Monaco from "monaco-editor";
 import { useThemeStore } from "../../store/themeStore";
 import { isLightTheme } from "../../lib/themes";
 import { attachCompletion } from "../../lib/monacoCompletion";
+import { addEditorCommand } from "../../lib/monaco";
 import type { CompletionContext } from "../../lib/monacoCompletion";
 
 const LINE_HEIGHT = 18;
@@ -57,12 +58,19 @@ export function QueryEditor({
     }
 
     if (multiline) {
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => submitRef.current());
+      addEditorCommand(editor, monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
+        submitRef.current(),
+      );
       return;
     }
     // One line: Enter runs the query - unless the suggestion list is open,
     // where it accepts the highlighted item as usual.
-    editor.addCommand(monaco.KeyCode.Enter, () => submitRef.current(), "!suggestWidgetVisible");
+    addEditorCommand(
+      editor,
+      monaco.KeyCode.Enter,
+      () => submitRef.current(),
+      "!suggestWidgetVisible",
+    );
     // Pasted multi-line JSON would hide everything past its first line.
     editor.onDidPaste(() => {
       if (!model || model.getLineCount() === 1) return;

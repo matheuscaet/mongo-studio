@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import type { HTMLAttributes, MouseEvent } from "react";
-import { ChevronRight, Database, MoreHorizontal } from "lucide-react";
+import { ChevronRight, Database, Loader2, MoreHorizontal } from "lucide-react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { DatabaseRow } from "./DatabaseRow";
 import type { CollectionMatches } from "./useCollectionMatches";
+import { databaseKey } from "../../store/sessionsStore";
 import { ContextMenu } from "../ui/ContextMenu";
 import type { ConnectionProfileMeta } from "../../types/connection";
 
@@ -17,7 +18,7 @@ interface ConnectionRowProps {
   rowProps?: HTMLAttributes<HTMLDivElement> & Record<`data-${string}`, string>;
   /** The sidebar search, lowercased. */
   query?: string;
-  /** Collections matching the search, if they belong to this connection. */
+  /** Collections matching the sidebar search, on any connection. */
   collectionMatches?: CollectionMatches | null;
 }
 
@@ -31,7 +32,9 @@ export function ConnectionRow({
   query = "",
   collectionMatches = null,
 }: ConnectionRowProps) {
-  const session = useConnectionsStore((s) => s.session);
+  const session = useConnectionsStore((s) => s.sessions[profile.id]);
+  const connecting = useConnectionsStore((s) => s.connecting[profile.id] ?? false);
+  const connectError = useConnectionsStore((s) => s.connectErrors[profile.id]);
   const connect = useConnectionsStore((s) => s.connect);
   const disconnect = useConnectionsStore((s) => s.disconnect);
   const deleteProfile = useConnectionsStore((s) => s.deleteProfile);
@@ -39,9 +42,9 @@ export function ConnectionRow({
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
 
-  const isActive = session?.connectionId === profile.id;
+  const isActive = session !== undefined;
   // a search that found collections here shows them, even if collapsed
-  const showChildren = expanded || collectionMatches !== null;
+  const showChildren = expanded || (collectionMatches?.connectionIds.has(profile.id) ?? false);
 
   useEffect(() => {
     if (isActive) setExpanded(true);
@@ -95,6 +98,13 @@ export function ConnectionRow({
           {isActive && (
             <span className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-status-green" />
           )}
+          {connecting && (
+            <Loader2
+              size={12}
+              className="ml-auto shrink-0 animate-spin text-text-faint"
+              aria-label="Connecting"
+            />
+          )}
         </button>
         <button
           type="button"
@@ -110,6 +120,15 @@ export function ConnectionRow({
           <MoreHorizontal size={14} />
         </button>
       </div>
+      {connectError && !isActive && (
+        <p
+          className="line-clamp-3 pb-1.5 pr-2 text-[11px] text-red-400"
+          style={{ paddingLeft: 26 + indent * INDENT_PX }}
+          title={connectError}
+        >
+          {connectError}
+        </p>
+      )}
       {menu && (
         <ContextMenu
           x={menu.x}
@@ -117,7 +136,7 @@ export function ConnectionRow({
           onClose={closeMenu}
           items={[
             isActive
-              ? { label: "Disconnect", onSelect: () => disconnect() }
+              ? { label: "Disconnect", onSelect: () => disconnect(profile.id) }
               : { label: "Connect", onSelect: () => connect(profile.id) },
             { label: "Edit connection...", onSelect: () => onEdit(profile.id) },
             { label: "Delete connection...", onSelect: handleDelete },
@@ -137,7 +156,7 @@ export function ConnectionRow({
               connection={{ id: profile.id, name: profile.name, summary: profile.summary }}
               query={query}
               matches={
-                collectionMatches?.database === db.name ? collectionMatches.collections : null
+                collectionMatches?.byDatabase.get(databaseKey(profile.id, db.name)) ?? null
               }
             />
           ))}

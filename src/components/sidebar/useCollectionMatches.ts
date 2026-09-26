@@ -1,38 +1,41 @@
 import { useMemo } from "react";
-import { useConnectionsStore } from "../../store/connectionsStore";
 import { useSessionsStore } from "../../store/sessionsStore";
+import type { DatabaseRef } from "../../store/sessionsStore";
 import type { CollectionInfo } from "../../types/connection";
 
 export interface CollectionMatches {
-  connectionId: string;
-  sessionId: string;
-  database: string;
-  collections: CollectionInfo[];
+  /** Matching collections by `databaseKey`. */
+  byDatabase: Map<string, CollectionInfo[]>;
+  /** Connections holding a match, which stay in view while searching. */
+  connectionIds: Set<string>;
+  /** Where Enter in the search goes. */
+  first: DatabaseRef & { collection: string };
 }
 
 /**
- * The open database's collections whose names contain the sidebar search,
- * or null when none do. Only that database's collections are in hand - the
- * sidebar loads one database at a time - so that's what the search covers.
+ * Collections whose names contain the sidebar search, or null when none
+ * do. It covers every database whose collections the sidebar has listed,
+ * on any connection - the others would cost a round trip each to search.
  */
 export function useCollectionMatches(query: string): CollectionMatches | null {
-  const session = useConnectionsStore((s) => s.session);
-  const collections = useSessionsStore((s) => s.collections);
-  const expandedDatabase = useSessionsStore((s) => s.expandedDatabase);
-  const collectionsDatabase = useSessionsStore((s) => s.collectionsDatabase);
-  const collectionsLoading = useSessionsStore((s) => s.collectionsLoading);
+  const databaseTree = useSessionsStore((s) => s.databaseTree);
 
   return useMemo(() => {
-    if (!query || !session || collectionsLoading) return null;
-    if (!expandedDatabase || expandedDatabase !== collectionsDatabase) return null;
-    const matching = collections.filter((c) => c.name.toLowerCase().includes(query));
-    return matching.length === 0
-      ? null
-      : {
-          connectionId: session.connectionId,
-          sessionId: session.sessionId,
-          database: expandedDatabase,
-          collections: matching,
-        };
-  }, [query, session, collections, expandedDatabase, collectionsDatabase, collectionsLoading]);
+    if (!query) return null;
+    const byDatabase = new Map<string, CollectionInfo[]>();
+    const connectionIds = new Set<string>();
+    let first: CollectionMatches["first"] | null = null;
+    for (const [key, tree] of Object.entries(databaseTree)) {
+      if (!tree.loaded) continue;
+      const matching = tree.collections.filter((c) => c.name.toLowerCase().includes(query));
+      if (matching.length === 0) continue;
+      // keys are "<connection id>/<database>", and ids hold no "/"
+      const slash = key.indexOf("/");
+      const connectionId = key.slice(0, slash);
+      byDatabase.set(key, matching);
+      connectionIds.add(connectionId);
+      first ??= { connectionId, database: key.slice(slash + 1), collection: matching[0].name };
+    }
+    return first ? { byDatabase, connectionIds, first } : null;
+  }, [query, databaseTree]);
 }

@@ -17,7 +17,7 @@ const verbosityOptions: { id: ExplainVerbosity; label: string }[] = [
 ];
 
 export function ExplainDialog({ tab, onClose }: ExplainDialogProps) {
-  const session = useConnectionsStore((s) => s.session);
+  const session = useConnectionsStore((s) => s.sessions[tab.connection.id]);
   const {
     database: selectedDatabase,
     collection: selectedCollection,

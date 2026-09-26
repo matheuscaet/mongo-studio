@@ -20,3 +20,25 @@ self.MonacoEnvironment = {
 
 loader.config({ monaco });
 registerMongoCompletion(monaco);
+
+let ownKeys = 0;
+
+/**
+ * `editor.addCommand`, but only for this editor. Monaco keeps keybindings
+ * in one service shared by every editor, and its `addCommand` doesn't tie
+ * the binding to the editor it's called on: with several editors bound to
+ * the same key, the last one registered handles it wherever it's pressed.
+ * Every tab's query editors stay mounted, so Enter in one tab's filter ran
+ * the newest tab's query. A context key set only in this editor's own
+ * scope makes the binding apply only while this editor has focus.
+ */
+export function addEditorCommand(
+  editor: monaco.editor.IStandaloneCodeEditor,
+  keybinding: number,
+  handler: () => void,
+  when?: string,
+) {
+  const key = `mongoStudioEditor${++ownKeys}`;
+  editor.createContextKey(key, true);
+  editor.addCommand(keybinding, handler, when ? `${key} && ${when}` : key);
+}

@@ -13,7 +13,7 @@ function isIndexStatEntry(value: unknown): value is IndexStatEntry {
 }
 
 export function IndexesPanel({ tab }: { tab: CollectionTab }) {
-  const session = useConnectionsStore((s) => s.session);
+  const session = useConnectionsStore((s) => s.sessions[tab.connection.id]);
   const { database: selectedDatabase, collection: selectedCollection, stats } = tab;
   const [statsByName, setStatsByName] = useState<Map<string, IndexStatEntry>>(new Map());
   const [statsError, setStatsError] = useState<string | null>(null);

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ArrowLeftRight, FolderPlus, Plus, Search } from "lucide-react";
-import { useConnectionsStore } from "../../store/connectionsStore";
+import { sessionIdFor, useConnectionsStore } from "../../store/connectionsStore";
 import { useSidebarLayoutStore } from "../../store/sidebarLayoutStore";
 import { useSessionsStore } from "../../store/sessionsStore";
 import { api } from "../../lib/tauri";
@@ -37,15 +37,18 @@ export function Sidebar() {
   // Enter opens the first collection found, so a few letters and Enter get
   // you to a collection without the mouse.
   function openFirstMatch() {
-    const profile = profiles.find((p) => p.id === collectionMatches?.connectionId);
-    if (!collectionMatches || !profile) return;
+    if (!collectionMatches) return;
+    const { connectionId, database, collection } = collectionMatches.first;
+    const profile = profiles.find((p) => p.id === connectionId);
+    const sessionId = sessionIdFor(connectionId);
+    if (!profile || !sessionId) return;
     useSessionsStore
       .getState()
       .openCollection(
-        collectionMatches.sessionId,
+        sessionId,
         { id: profile.id, name: profile.name, summary: profile.summary },
-        collectionMatches.database,
-        collectionMatches.collections[0].name,
+        database,
+        collection,
       );
   }
 

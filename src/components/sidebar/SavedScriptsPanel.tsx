@@ -1,15 +1,16 @@
 import { useEffect, useState } from "react";
 import { ChevronRight, FileCode, RefreshCw } from "lucide-react";
 import { useScriptsStore } from "../../store/scriptsStore";
-import { NO_TAB_CONSOLE } from "../../store/consoleStore";
-import { selectActiveTab, useSessionsStore } from "../../store/sessionsStore";
+import { useSessionsStore } from "../../store/sessionsStore";
 
 /** Console scripts saved to disk, pinned to the bottom of the sidebar. */
 export function SavedScriptsPanel() {
   const saved = useScriptsStore((s) => s.saved);
   // highlight the file open in the console on screen - the active tab's
-  const consoleKey = useSessionsStore((s) => selectActiveTab(s)?.id ?? NO_TAB_CONSOLE);
-  const currentPath = useScriptsStore((s) => s.files[consoleKey]?.path ?? null);
+  const consoleKey = useSessionsStore((s) => s.activeTabId);
+  const currentPath = useScriptsStore((s) =>
+    consoleKey === null ? null : (s.files[consoleKey]?.path ?? null),
+  );
   const listError = useScriptsStore((s) => s.listError);
   const refresh = useScriptsStore((s) => s.refresh);
   const open = useScriptsStore((s) => s.open);

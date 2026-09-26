@@ -2,17 +2,8 @@ import { useEffect, useRef } from "react";
 import Editor from "@monaco-editor/react";
 import { Save, X } from "lucide-react";
 import { useConnectionsStore } from "../../store/connectionsStore";
-import {
-  selectActiveTab,
-  selectCurrentDatabase,
-  useSessionsStore,
-} from "../../store/sessionsStore";
-import {
-  NO_TAB_CONSOLE,
-  currentConsoleTarget,
-  defaultScript,
-  useConsoleStore,
-} from "../../store/consoleStore";
+import type { Tab } from "../../store/sessionsStore";
+import { currentConsoleTarget, defaultScript, useConsoleStore } from "../../store/consoleStore";
 import { hasUnsavedEdits, useScriptsStore } from "../../store/scriptsStore";
 import { useThemeStore } from "../../store/themeStore";
 import { isLightTheme } from "../../lib/themes";
@@ -21,15 +12,15 @@ import { ConsoleLayoutToggle } from "./ConsoleLayoutToggle";
 import { SplitPane } from "../ui/SplitPane";
 import { DEFAULT_CONSOLE_SPLIT, useUiStore } from "../../store/uiStore";
 import { attachCompletion } from "../../lib/monacoCompletion";
+import { addEditorCommand } from "../../lib/monaco";
 import { ResultViewToggle } from "../json/ResultViewToggle";
 
-export function ScriptConsole() {
-  const session = useConnectionsStore((s) => s.session);
-  const activeTab = useSessionsStore(selectActiveTab);
-  const currentDatabase = useSessionsStore(selectCurrentDatabase);
+/** The script console of a tab: a console tab, or a collection tab's own. */
+export function ScriptConsole({ tab }: { tab: Tab }) {
+  const session = useConnectionsStore((s) => s.sessions[tab.connection.id]);
   const themeId = useThemeStore((s) => s.themeId);
 
-  const key = activeTab?.id ?? NO_TAB_CONSOLE;
+  const key = tab.id;
   const consoleSession = useConsoleStore((s) => s.consoles[key]);
   const setScript = useConsoleStore((s) => s.setScript);
   const cancel = useConsoleStore((s) => s.cancel);
@@ -58,22 +49,16 @@ export function ScriptConsole() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  if (!session) {
-    return (
-      <div className="flex h-full items-center justify-center text-text-muted">
-        Connect to a database to use the script console
-      </div>
-    );
-  }
+  if (!session) return null;
 
-  const database = currentDatabase ?? session.databases[0]?.name ?? null;
-  const untouched = defaultScript(database, activeTab?.collection ?? null);
+  const database = tab.database;
+  const untouched = defaultScript(database, tab.collection);
   const script = consoleSession?.script ?? untouched;
   const running = consoleSession?.running ?? false;
 
   function handleRun() {
     const target = currentConsoleTarget();
-    if (!target.session || !target.database) return;
+    if (!target?.session) return;
     useConsoleStore
       .getState()
       .run(target.key, target.session.sessionId, target.database, target.script);
@@ -84,12 +69,11 @@ export function ScriptConsole() {
       <div className="flex items-center justify-between border-b border-border-subtle px-3 py-1.5 text-xs text-text-muted">
         <span>
           Script console
-          {database ? (
-            <span className="ml-2 font-mono text-text-default">
-              {activeTab ? `${activeTab.database}.${activeTab.collection}` : database}
-            </span>
-          ) : (
-            <span className="ml-2 text-amber-400">select a database first</span>
+          <span className="ml-2 font-mono text-text-default">
+            {tab.kind === "collection" ? `${tab.database}.${tab.collection}` : tab.database}
+          </span>
+          {tab.kind === "console" && (
+            <span className="ml-1.5 text-text-faint">any collection</span>
           )}
           <span
             className="ml-3 inline-flex items-center gap-1 rounded bg-panel-alt px-1.5 py-0.5 font-mono"
@@ -143,7 +127,6 @@ export function ScriptConsole() {
           ) : (
             <button
               type="button"
-              disabled={!database}
               className="rounded bg-run px-3 py-1 text-white hover:bg-run-hover disabled:opacity-50"
               onClick={handleRun}
             >
@@ -187,17 +170,18 @@ export function ScriptConsole() {
                     editor: "console",
                     // the collection comes from db.collection("…") in the text
                     context: () => {
-                      const { session: current, database } = currentConsoleTarget();
-                      return current && database
-                        ? { sessionId: current.sessionId, database, collection: null }
+                      const target = currentConsoleTarget();
+                      return target?.session
+                        ? {
+                            sessionId: target.session.sessionId,
+                            database: target.database,
+                            collection: null,
+                          }
                         : null;
                     },
                   });
                 }
-                editor.addCommand(
-                  monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
-                  handleRun,
-                );
+                addEditorCommand(editor, monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, handleRun);
               }}
             />
           </div>

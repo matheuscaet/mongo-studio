@@ -14,7 +14,7 @@ const modes: { id: QueryMode; label: string }[] = [
 ];
 
 export function QueryBar({ tab }: { tab: CollectionTab }) {
-  const session = useConnectionsStore((s) => s.session);
+  const session = useConnectionsStore((s) => s.sessions[tab.connection.id]);
   const updateTab = useSessionsStore((s) => s.updateTab);
   const runQuery = useSessionsStore((s) => s.runQuery);
   const [explainOpen, setExplainOpen] = useState(false);

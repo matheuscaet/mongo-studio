@@ -26,7 +26,7 @@ export const DocumentGrid = memo(function DocumentGrid({ tab }: { tab: Collectio
   } = tab;
   const [exportOpen, setExportOpen] = useState(false);
   const resultView = useUiStore((s) => s.resultView);
-  const session = useConnectionsStore((s) => s.session);
+  const session = useConnectionsStore((s) => s.sessions[tab.connection.id]);
   const replaceDocument = useSessionsStore((s) => s.replaceDocument);
 
   // Values are editable only in find results; see CollectionTab.resultsMode.

@@ -163,13 +163,13 @@ export function ConnectionTree({ search, onEdit }: ConnectionTreeProps) {
   const query = search.trim().toLowerCase();
   const searching = query !== "";
   const collectionMatches = useCollectionMatches(query);
-  // A connection stays in view when its name matches, or when collections of
-  // its open database do.
+  // A connection stays in view when its name matches, or when collections
+  // listed under it do.
   const shown = searching
     ? filterTree(
         root,
         (id) =>
-          id === collectionMatches?.connectionId ||
+          (collectionMatches?.connectionIds.has(id) ?? false) ||
           (byId.get(id)?.name.toLowerCase().includes(query) ?? false),
       )
     : root;
@@ -201,9 +201,7 @@ export function ConnectionTree({ search, onEdit }: ConnectionTreeProps) {
           onEdit={onEdit}
           indent={depth}
           query={query}
-          collectionMatches={
-            collectionMatches?.connectionId === node.id ? collectionMatches : null
-          }
+          collectionMatches={collectionMatches}
           rowProps={{
             "data-node-id": node.id,
             "data-node-type": "connection",
