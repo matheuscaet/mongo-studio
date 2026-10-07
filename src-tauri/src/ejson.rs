@@ -117,6 +117,23 @@ mod tests {
         );
     }
 
+    /// The result views read a UUID from this shape (src/lib/bsonValue.ts:
+    /// uuidText), and a `UUID("…")` filter must find the same value.
+    #[test]
+    fn sends_a_uuid_as_a_subtype_4_binary() {
+        let uuid = bson::Uuid::parse_str("18e8acbb-14b3-416d-b074-dcd59b0587df").unwrap();
+        let json = document_to_json(doc! { "key": uuid });
+        assert_eq!(
+            json["key"],
+            serde_json::json!({ "$binary": { "base64": "GOisuxSzQW2wdNzVmwWH3w==", "subType": "04" } })
+        );
+        let filter = json_to_document(
+            serde_json::json!({ "key": { "$uuid": "18e8acbb-14b3-416d-b074-dcd59b0587df" } }),
+        )
+        .unwrap();
+        assert_eq!(filter.get("key"), Some(&Bson::from(uuid)));
+    }
+
     #[test]
     fn rejects_non_object_filter() {
         let err = json_to_document(Value::String("nope".to_string()));

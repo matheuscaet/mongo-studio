@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { childEntries } from "../../lib/bsonValue";
+import { orderFields } from "../../lib/documentColumns";
 import { documentKey, shortTypeName } from "../../lib/bsonFormat";
 import { InlineValue } from "./InlineValue";
 import { JsonTreeNode } from "./JsonTreeNode";
@@ -41,7 +42,9 @@ export function JsonTree({
   ...aria
 }: JsonTreeProps) {
   const docKey = useMemo(() => documentKey(doc), [doc]);
-  const entries = childEntries(value);
+  const fields = childEntries(value);
+  // a document's own fields: _id first, __v and the like last
+  const entries = fields && path.length === 0 && !Array.isArray(value) ? orderFields(fields) : fields;
   const label = aria["aria-label"];
 
   return (

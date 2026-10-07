@@ -11,6 +11,7 @@ import {
   isPlainObject,
   plainText,
   relativeTime,
+  uuidText,
 } from "./bsonValue";
 
 /**
@@ -38,6 +39,7 @@ const SHORT_TYPES: Record<string, string> = {
   Object: "obj",
   Document: "obj",
   Binary: "bin",
+  UUID: "uuid",
   Regex: "regex",
   Timestamp: "ts",
   Symbol: "sym",
@@ -97,7 +99,7 @@ export function formatDate(value: unknown, withSeconds = false): string | null {
   return normal.slice(0, withSeconds ? 19 : 16).replace("T", " ");
 }
 
-/** A scalar's text without its BSON wrapper: bare hex, bare decimal, trimmed date. */
+/** A scalar's text without its BSON wrapper: bare hex or UUID, bare decimal, trimmed date. */
 function scalarText(value: unknown, withSeconds: boolean): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "string") return value;
@@ -108,6 +110,8 @@ function scalarText(value: unknown, withSeconds: boolean): string {
     const inner = wrapped(value, tag);
     if (inner !== null) return inner;
   }
+  const uuid = uuidText(value);
+  if (uuid !== null) return uuid;
   return bsonLiteral(value) ?? plainText(value);
 }
 

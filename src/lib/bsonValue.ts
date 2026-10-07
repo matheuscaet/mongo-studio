@@ -16,6 +16,27 @@ function bsonTag(value: unknown): string | null {
 }
 
 /**
+ * The text of a UUID (binary subtype 4, 16 bytes), dashed and lowercase, or
+ * null for anything else. Relaxed Extended JSON sends a UUID as any other
+ * binary, `{ $binary: { base64, subType: "04" } }`, which nobody can read
+ * or search by.
+ */
+export function uuidText(value: unknown): string | null {
+  if (!isPlainObject(value) || Object.keys(value).length !== 1) return null;
+  const bin = value.$binary;
+  if (!isPlainObject(bin) || bin.subType !== "04" || typeof bin.base64 !== "string") return null;
+  let bytes: string;
+  try {
+    bytes = atob(bin.base64);
+  } catch {
+    return null;
+  }
+  if (bytes.length !== 16) return null;
+  const hex = Array.from(bytes, (c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
  * Renders a BSON wrapper as the scalar it stands for, spelled the way mongosh
  * spells it. Returns null for anything that is a genuine object.
  */
@@ -49,6 +70,9 @@ export function bsonLiteral(value: unknown): string | null {
       return `Timestamp(${String(ts.t)}, ${String(ts.i)})`;
     }
     case "$binary": {
+      // spelled as a query takes it back: { field: UUID("…") }
+      const uuid = uuidText(value);
+      if (uuid !== null) return `UUID("${uuid}")`;
       const bin = value.$binary;
       if (!isPlainObject(bin)) return null;
       const base64 = String(bin.base64 ?? "");
@@ -111,6 +135,7 @@ export function bsonTypeName(value: unknown, isRoot = false): string {
   if (Array.isArray(value)) return "Array";
   if (isPlainObject(value)) {
     const tag = bsonTag(value);
+    if (uuidText(value) !== null) return "UUID";
     if (tag !== null && bsonLiteral(value) !== null) return TAG_TYPES[tag] ?? "Object";
     return isRoot ? "Document" : "Object";
   }
