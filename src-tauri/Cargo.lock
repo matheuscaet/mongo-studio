@@ -3536,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "mongo-studio"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aes-gcm",
  "apple-native-keyring-store",
