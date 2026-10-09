@@ -1,6 +1,6 @@
 [package]
 name = "mongo-studio"
-version = "1.0.2"
+version = "1.0.3"
 description = "An open-source MongoDB GUI client"
 authors = ["Matheus Caetano"]
 edition = "2021"
