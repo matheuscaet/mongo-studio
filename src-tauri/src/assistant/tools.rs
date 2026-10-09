@@ -1128,13 +1128,19 @@ mod tests {
 
 #[cfg(test)]
 mod live_tests {
-    //! Against the local dev database (`shop`, seeded by
-    //! scripts/seed-dev-data.js). Run with:
+    //! Against a throwaway database (`mongo_studio_test`), the same fixed
+    //! name driver.rs's and scripting.rs's self-seeding live tests use.
+    //! Each test seeds its own `orders_<uuid>` collection, so nothing here
+    //! depends on dev data. The collection is dropped at the end of a passing
+    //! run; a failing one leaves it behind, under a name no other run reuses.
+    //! Run with:
     //!   MONGO_STUDIO_TEST_URI=mongodb://localhost:27017 \
     //!     cargo test --lib -- --ignored assistant::tools::live_tests
     use super::super::test_support::{inner_with, session, RecordingHost};
     use super::super::AssistantPolicy;
     use super::*;
+
+    const TEST_DB: &str = "mongo_studio_test";
 
     async fn setup(policy: AssistantPolicy) -> (Arc<RecordingHost>, Arc<AgentSession>, Arc<Inner>) {
         let uri = std::env::var("MONGO_STUDIO_TEST_URI")
@@ -1144,7 +1150,7 @@ mod live_tests {
             client: Some(client),
             ..Default::default()
         });
-        let session = session("shop", "c1");
+        let session = session(TEST_DB, "c1");
         let inner = inner_with(host.clone(), &session, policy);
         (host, session, inner)
     }
@@ -1158,22 +1164,53 @@ mod live_tests {
         }
     }
 
+    /// A fresh collection name per test run, so two runs (or the two tests
+    /// in this module) never collide or depend on each other's leftovers.
+    fn fresh_collection() -> String {
+        format!("orders_{}", Uuid::new_v4().simple())
+    }
+
+    /// Enough orders to exercise every assertion below: more than one
+    /// document (plural wording, and `find`'s `limit: 2`), a `status` of
+    /// "shipped" (the `explain` filter), and more than one distinct status
+    /// (the `$group` pipelines). `_id` is left to the server, which always
+    /// assigns an ObjectId.
+    async fn seed_orders(client: &Client, coll: &str) {
+        collection(client, TEST_DB, coll)
+            .insert_many(vec![
+                doc! { "status": "shipped", "total": 42 },
+                doc! { "status": "shipped", "total": 17 },
+                doc! { "status": "pending", "total": 5 },
+                doc! { "status": "cancelled", "total": 3 },
+            ])
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_schema_and_counts() {
         let (host, session, inner) = setup(open_policy()).await;
+        let client = host.client.clone().unwrap();
+        let coll = fresh_collection();
+        seed_orders(&client, &coll).await;
+        let target = format!("{TEST_DB}.{coll}");
 
         let out = call(&inner, &session, "list_collections", json!({}))
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.contains("orders (collection)"), "{}", out.text);
+        assert!(
+            out.text.contains(&format!("{coll} (collection)")),
+            "{}",
+            out.text
+        );
 
         let out = call(
             &inner,
             &session,
             "sample_schema",
-            json!({ "collection": "orders", "size": 50 }),
+            json!({ "collection": coll, "size": 50 }),
         )
         .await
         .unwrap();
@@ -1186,12 +1223,12 @@ mod live_tests {
             &inner,
             &session,
             "count",
-            json!({ "collection": "orders", "filter": {} }),
+            json!({ "collection": coll, "filter": {} }),
         )
         .await
         .unwrap();
         assert!(
-            out.text.contains("documents in shop.orders match"),
+            out.text.contains(&format!("documents in {target} match")),
             "{}",
             out.text
         );
@@ -1201,21 +1238,27 @@ mod live_tests {
             .iter()
             .find(|s| s["tool"] == "sample_schema" && s["state"] == "ok")
             .unwrap();
-        assert_eq!(sampled["label"], "Sampled shop.orders");
+        assert_eq!(sampled["label"], format!("Sampled {target}"));
         println!("sample meta: {}", sampled["meta"]);
         assert!(sampled["meta"].as_str().unwrap().contains(" documents · "));
+
+        collection(&client, TEST_DB, &coll).drop().await.unwrap();
     }
 
     #[tokio::test]
     #[ignore]
     async fn live_indexes_explain_find_aggregate() {
         let (host, session, inner) = setup(open_policy()).await;
+        let client = host.client.clone().unwrap();
+        let coll = fresh_collection();
+        seed_orders(&client, &coll).await;
+        let target = format!("{TEST_DB}.{coll}");
 
         let out = call(
             &inner,
             &session,
             "list_indexes",
-            json!({ "collection": "orders" }),
+            json!({ "collection": coll }),
         )
         .await
         .unwrap();
@@ -1226,7 +1269,7 @@ mod live_tests {
             &inner,
             &session,
             "explain",
-            json!({ "collection": "orders", "filter": { "status": "shipped" }, "sort": { "_id": -1 } }),
+            json!({ "collection": coll, "filter": { "status": "shipped" }, "sort": { "_id": -1 } }),
         )
         .await
         .unwrap();
@@ -1238,7 +1281,7 @@ mod live_tests {
             &inner,
             &session,
             "explain",
-            json!({ "collection": "orders", "pipeline": [{ "$group": { "_id": "$status", "n": { "$sum": 1 } } }] }),
+            json!({ "collection": coll, "pipeline": [{ "$group": { "_id": "$status", "n": { "$sum": 1 } } }] }),
         )
         .await
         .unwrap();
@@ -1249,12 +1292,13 @@ mod live_tests {
             &inner,
             &session,
             "find",
-            json!({ "collection": "orders", "limit": 2, "projection": { "_id": 1 } }),
+            json!({ "collection": coll, "limit": 2, "projection": { "_id": 1 } }),
         )
         .await
         .unwrap();
         assert!(
-            out.text.starts_with("Read 2 documents from shop.orders"),
+            out.text
+                .starts_with(&format!("Read 2 documents from {target}")),
             "{}",
             out.text
         );
@@ -1264,7 +1308,7 @@ mod live_tests {
             &inner,
             &session,
             "aggregate",
-            json!({ "collection": "orders", "pipeline": [{ "$group": { "_id": "$status", "n": { "$sum": 1 } } }] }),
+            json!({ "collection": coll, "pipeline": [{ "$group": { "_id": "$status", "n": { "$sum": 1 } } }] }),
         )
         .await
         .unwrap();
@@ -1284,7 +1328,7 @@ mod live_tests {
             &inner,
             &session,
             "aggregate",
-            json!({ "collection": "orders", "pipeline": [{ "$out": "copy" }] }),
+            json!({ "collection": coll, "pipeline": [{ "$out": "copy" }] }),
         )
         .await
         .unwrap();
@@ -1297,6 +1341,8 @@ mod live_tests {
             .find(|s| s["tool"] == "find" && s["state"] == "ok")
             .unwrap();
         assert_eq!(find_ok["meta"], "document values on");
-        assert_eq!(find_ok["label"], "Read 2 documents from shop.orders");
+        assert_eq!(find_ok["label"], format!("Read 2 documents from {target}"));
+
+        collection(&client, TEST_DB, &coll).drop().await.unwrap();
     }
 }
