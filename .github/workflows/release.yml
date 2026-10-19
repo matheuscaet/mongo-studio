@@ -41,9 +41,17 @@ jobs:
           }
           id=$(find_id)
           if [ -z "$id" ]; then
-            gh release create "$TAG" --verify-tag --draft --generate-notes \
-              --title "Mongo Studio $TAG"
-            id=$(find_id)
+            # Take the id from the create response: a fresh draft can take a
+            # while to show up in the releases list, so looking it up again
+            # right away can come back empty.
+            gh api "repos/$GH_REPO/git/ref/tags/$TAG" --silent
+            id=$(gh api -X POST "repos/$GH_REPO/releases" \
+              -f tag_name="$TAG" -f name="Mongo Studio $TAG" \
+              -F draft=true -F generate_release_notes=true --jq .id)
+          fi
+          if [ -z "$id" ]; then
+            echo "::error::Could not find or create a release for $TAG"
+            exit 1
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
