@@ -16,7 +16,7 @@ name: Auto release
 # read & write on this repo). Pushes made with the default GITHUB_TOKEN would
 # also not start release.yml.
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
     branches: [main]
 
