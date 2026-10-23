@@ -140,8 +140,11 @@ interface SessionsState {
   ) => Promise<void>;
   /** Focuses the relation's editor tab, opening it on the connection its samples come from. */
   openRelation: (relationId: string, connection: TabConnection, database: string) => void;
-  /** Points a console tab at another database of its connection, as `use <db>` does. */
-  switchConsoleDatabase: (id: string, database: string) => void;
+  /**
+   * Points a console tab at another database, as `use <db>` does - on its
+   * own connection, or on `connection` to move it to another server.
+   */
+  switchConsoleDatabase: (id: string, database: string, connection?: TabConnection) => void;
   /** Opens a new console on the database, however many it already has; returns its tab id. */
   openConsole: (
     connection: TabConnection,
@@ -346,19 +349,21 @@ export const useSessionsStore = create<SessionsState>((set, get) => {
       });
     },
 
-    switchConsoleDatabase: (id, database) =>
+    switchConsoleDatabase: (id, database, connection) =>
       set((s) => ({
-        tabs: s.tabs.map((t) =>
-          t.id === id && t.kind === TabKind.Console && t.database !== database
-            ? {
-                ...t,
-                database,
-                // the collection it was opened from belongs to the old database
-                collection: null,
-                number: nextConsoleNumber(s.tabs, t.connection.id, database),
-              }
-            : t,
-        ),
+        tabs: s.tabs.map((t) => {
+          if (t.id !== id || t.kind !== TabKind.Console) return t;
+          const target = connection ?? t.connection;
+          if (target.id === t.connection.id && t.database === database) return t;
+          return {
+            ...t,
+            connection: target,
+            database,
+            // the collection it was opened from belongs to the old database
+            collection: null,
+            number: nextConsoleNumber(s.tabs, target.id, database),
+          };
+        }),
       })),
 
     activateTab: (id) => set({ activeTabId: id }),
