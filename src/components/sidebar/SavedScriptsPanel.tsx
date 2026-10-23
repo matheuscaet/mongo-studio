@@ -57,7 +57,8 @@ export function SavedScriptsPanel() {
           </div>
         )}
         <p className="px-3 py-2.5 text-sm leading-normal text-fg-3">
-          Opening a script starts a console on the database in view. <Kbd>Ctrl S</Kbd> saves the
+          Opening a script starts a console on the database in view; its target pill moves it to
+          another database or connection. <Kbd>Ctrl S</Kbd> saves the
           console you are in; scripts saved without a location land in{" "}
           <span className="font-data">~/mongo-studio-scripts</span>.
         </p>
