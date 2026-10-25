@@ -47,6 +47,7 @@ pub fn run() {
             commands::list_connection_profiles,
             commands::get_connection_profile,
             commands::save_connection_profile,
+            commands::set_legacy_uuid_encoding,
             commands::delete_connection_profile,
             commands::test_connection,
             commands::connect,

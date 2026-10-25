@@ -7,6 +7,7 @@ import { EditableValue } from "./EditableValue";
 import { FieldMenuContext } from "./FieldMenuContext";
 import { InlineValue } from "./InlineValue";
 import { KvRow } from "./KvRow";
+import { useLegacyUuid } from "./LegacyUuidContext";
 import { ValueEditContext } from "./ValueEditContext";
 
 export interface JsonTreeNodeProps {
@@ -31,6 +32,7 @@ export function JsonTreeNode(props: JsonTreeNodeProps) {
   const [open, setOpen] = useState(depth < defaultOpenDepth);
   const saved = useContext(ValueEditContext)?.saved ?? null;
   const fieldMenu = useContext(FieldMenuContext);
+  const legacyUuid = useLegacyUuid();
 
   const children = childEntries(value);
   const hasChildren = children !== null && children.length > 0;
@@ -51,7 +53,7 @@ export function JsonTreeNode(props: JsonTreeNodeProps) {
             <span className="text-json-key">{name}</span>
           )
         }
-        type={shortTypeName(value)}
+        type={shortTypeName(value, legacyUuid)}
         valueClassName={truncate ? "truncate" : "break-words whitespace-pre-wrap"}
       >
         <EditableValue

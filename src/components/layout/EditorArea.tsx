@@ -6,7 +6,9 @@ import { DormantTab } from "./DormantTab";
 import { CollectionTabs } from "../tabs/CollectionTabs";
 import { TabDragGhost } from "../tabs/TabDragGhost";
 import { useTabDragStore } from "../tabs/useTabDrag";
+import { LegacyUuidContext } from "../json/LegacyUuidContext";
 import { SPLIT_LAYOUTS } from "../../lib/editorLayout";
+import { useConnectionsStore } from "../../store/connectionsStore";
 import { useEditorLayoutStore } from "../../store/editorLayoutStore";
 import { selectActiveTab, type Tab, TabKind, useSessionsStore } from "../../store/sessionsStore";
 import { cn } from "@/lib/utils";
@@ -147,8 +149,19 @@ export function EditorArea() {
   );
 }
 
-/** What a live tab shows, by its kind. */
+/** What a live tab shows, by its kind, reading legacy UUIDs as its connection does. */
 function TabBody({ tab, active, shown }: { tab: Tab; active: boolean; shown: boolean }) {
+  const legacyUuid = useConnectionsStore(
+    (s) => s.profiles.find((p) => p.id === tab.connection.id)?.legacyUuid ?? "raw",
+  );
+  return (
+    <LegacyUuidContext.Provider value={legacyUuid}>
+      <TabKindBody tab={tab} active={active} shown={shown} />
+    </LegacyUuidContext.Provider>
+  );
+}
+
+function TabKindBody({ tab, active, shown }: { tab: Tab; active: boolean; shown: boolean }) {
   switch (tab.kind) {
     case TabKind.Collection:
       return <CollectionTabView tab={tab} active={active} shown={shown} />;

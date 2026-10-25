@@ -15,6 +15,9 @@
  *   NumberInt(…), Int32(…)              → { $numberInt }
  *   NumberDecimal("…"), Decimal128("…") → { $numberDecimal }
  *   UUID("…")                           → { $uuid }
+ *   LegacyJavaUUID("…"), LegacyCSharpUUID("…"), LegacyPythonUUID("…")
+ *                                       → { $binary } subtype 3, in that
+ *                                         driver's byte order
  *   Timestamp(t, i), BinData(sub, "…"), MinKey, MaxKey
  * - regex literals `/pat/flags` → { $regularExpression: { pattern, options } }
  * - NaN and Infinity → { $numberDouble }
@@ -22,6 +25,8 @@
  * It's a small hand-written parser rather than `eval`: the text is data a
  * user typed (or the Assistant wrote), and nothing in it should ever run.
  */
+
+import { legacyByteOrder, type LegacyUuidEncoding } from "./bsonValue";
 
 /** A query that can't be read, with where in the text it went wrong. */
 export class QuerySyntaxError extends Error {
@@ -294,6 +299,9 @@ const HELPERS = [
   "NumberDecimal",
   "Decimal128",
   "UUID",
+  "LegacyJavaUUID",
+  "LegacyCSharpUUID",
+  "LegacyPythonUUID",
   "Timestamp",
   "BinData",
   "MinKey",
@@ -495,6 +503,21 @@ function arity(call: Call, count: number, example: string) {
   }
 }
 
+/** The 32 lowercase hex digits of a UUID helper's one argument. */
+function uuidHex(call: Call, name: Helper): string {
+  arity(call, 1, `${name}("3b241101-e2bb-4255-8caf-4136c566a962")`);
+  const [{ value, token }] = call.args;
+  const hex = typeof value === "string" ? value.replace(/-/g, "") : "";
+  if (!/^[0-9a-fA-F]{32}$/.test(hex)) failAt(token, "A UUID is 32 hex characters, with or without dashes");
+  return hex.toLowerCase();
+}
+
+const LEGACY_HELPER_ORDERS: Record<string, LegacyUuidEncoding> = {
+  LegacyJavaUUID: "java",
+  LegacyCSharpUUID: "csharp",
+  LegacyPythonUUID: "python",
+};
+
 const INT32_MIN = -(2 ** 31);
 const INT32_MAX = 2 ** 31 - 1;
 const INT64_MIN = -(2n ** 63n);
@@ -563,12 +586,18 @@ function helper(name: Helper, call: Call): unknown {
     }
 
     case "UUID": {
-      arity(call, 1, 'UUID("3b241101-e2bb-4255-8caf-4136c566a962")');
-      const [{ value, token }] = call.args;
-      const hex = typeof value === "string" ? value.replace(/-/g, "") : "";
-      if (!/^[0-9a-fA-F]{32}$/.test(hex)) failAt(token, "A UUID is 32 hex characters, with or without dashes");
-      const h = hex.toLowerCase();
+      const h = uuidHex(call, name);
       return { $uuid: `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}` };
+    }
+
+    case "LegacyJavaUUID":
+    case "LegacyCSharpUUID":
+    case "LegacyPythonUUID": {
+      // the bytes as that driver stored them, so a value copied from a
+      // result finds its document
+      const stored = legacyByteOrder(uuidHex(call, name), LEGACY_HELPER_ORDERS[name]);
+      const bytes = String.fromCharCode(...(stored.match(/../g) ?? []).map((b) => parseInt(b, 16)));
+      return { $binary: { base64: btoa(bytes), subType: "03" } };
     }
 
     case "Timestamp": {

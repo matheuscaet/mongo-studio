@@ -21,8 +21,8 @@ use crate::models::{
     ConnectionImportPreview, ConnectionProfile, ConnectionProfileInput, ConnectionProfileMeta,
     ConnectionSource, ConnectionTestResult, ConnectionsExportSummary, ConnectionsImportSummary,
     DatabaseInfo, ExplainQueryInput, ExplainVerbosity, ExportOptions, ExportQueryInput,
-    ExportSummary, FindQueryInput, QueryResultPage, ScriptResult, SecretBackendInfo,
-    SecretBackendKind, TlsOptions,
+    ExportSummary, FindQueryInput, LegacyUuidEncoding, QueryResultPage, ScriptResult,
+    SecretBackendInfo, SecretBackendKind, TlsOptions,
 };
 use crate::mongosh::{Mongosh, MongoshInfo, MongoshRunOptions};
 use crate::relations::{self, engine, sampling, Aggregate, Dir, Relation, RelationsStore};
@@ -177,6 +177,22 @@ pub async fn save_connection_profile(
         logging::route(&saved),
         yes_no(saved.has_password)
     );
+    Ok(ConnectionProfileMeta::from(&saved))
+}
+
+/// Sets how a connection's legacy UUIDs show, leaving the rest of it alone.
+#[tauri::command]
+pub fn set_legacy_uuid_encoding(
+    state: State<AppState>,
+    id: String,
+    encoding: Option<LegacyUuidEncoding>,
+) -> AppResult<ConnectionProfileMeta> {
+    let saved = state.connection_store.get(&id).and_then(|mut profile| {
+        profile.advanced.legacy_uuid = encoding;
+        profile.updated_at = now_iso();
+        state.connection_store.upsert(profile)
+    });
+    let saved = logged("set_legacy_uuid_encoding", saved)?;
     Ok(ConnectionProfileMeta::from(&saved))
 }
 

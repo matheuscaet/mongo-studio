@@ -3,6 +3,7 @@ import { valueTitle } from "../../lib/bsonFormat";
 import { editText } from "../../lib/valueEdit";
 import { useValueEdit } from "../json/useValueEdit";
 import { ValueInput } from "../json/ValueInput";
+import { useLegacyUuid } from "../json/LegacyUuidContext";
 import { BsonCell } from "./BsonCell";
 
 interface DocumentTableCellProps {
@@ -16,6 +17,7 @@ interface DocumentTableCellProps {
 /** A grid cell: its value, or an in-place editor after a double-click. */
 export function DocumentTableCell({ doc, field, value, className }: DocumentTableCellProps) {
   const edit = useValueEdit(value, doc, [field]);
+  const legacyUuid = useLegacyUuid();
   const base = "h-6 max-w-[280px] border-r border-b border-line-soft";
 
   if (edit.editing && edit.kind !== null) {
@@ -41,7 +43,7 @@ export function DocumentTableCell({ doc, field, value, className }: DocumentTabl
         edit.editable && "cursor-text",
         className,
       )}
-      title={value === undefined ? undefined : valueTitle(value)}
+      title={value === undefined ? undefined : valueTitle(value, legacyUuid)}
       onDoubleClick={
         edit.editable
           ? (e) => {

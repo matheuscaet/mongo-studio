@@ -1,5 +1,6 @@
 import { cellText, objectIdHex, valueTone } from "../../lib/bsonFormat";
 import type { ValueTone } from "../../lib/bsonFormat";
+import { useLegacyUuid } from "../json/LegacyUuidContext";
 
 /** In the grid plain strings stay in body text; only other types take color. */
 const TONE_CLASS: Record<ValueTone, string> = {
@@ -13,6 +14,7 @@ const TONE_CLASS: Record<ValueTone, string> = {
 
 /** A value as a grid cell shows it; nothing for a field the document lacks. */
 export function BsonCell({ value }: { value: unknown }) {
+  const legacyUuid = useLegacyUuid();
   if (value === undefined) return null;
   const hex = objectIdHex(value);
   if (hex !== null && hex.length > 12) {
@@ -25,5 +27,5 @@ export function BsonCell({ value }: { value: unknown }) {
       </span>
     );
   }
-  return <span className={TONE_CLASS[valueTone(value)]}>{cellText(value)}</span>;
+  return <span className={TONE_CLASS[valueTone(value)]}>{cellText(value, legacyUuid)}</span>;
 }

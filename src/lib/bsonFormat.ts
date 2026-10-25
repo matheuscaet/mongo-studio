@@ -9,10 +9,12 @@ import {
   childEntries,
   dateIso,
   isPlainObject,
+  legacyUuidText,
   plainText,
   relativeTime,
   uuidText,
 } from "./bsonValue";
+import type { LegacyUuidEncoding } from "./bsonValue";
 
 /**
  * The type name a grid header shows, e.g. "ObjectId" or "Decimal128".
@@ -20,9 +22,9 @@ import {
  * Relaxed Extended JSON writes Int32, Int64 and Double alike as plain
  * numbers, so an integer stays "Number"; only a fraction is surely a Double.
  */
-export function typeName(value: unknown): string {
+export function typeName(value: unknown, legacy: LegacyUuidEncoding = "raw"): string {
   if (typeof value === "number" && !Number.isInteger(value)) return "Double";
-  return bsonTypeName(value);
+  return bsonTypeName(value, false, legacy);
 }
 
 const SHORT_TYPES: Record<string, string> = {
@@ -40,6 +42,7 @@ const SHORT_TYPES: Record<string, string> = {
   Document: "obj",
   Binary: "bin",
   UUID: "uuid",
+  LegacyUUID: "uuid·3",
   Regex: "regex",
   Timestamp: "ts",
   Symbol: "sym",
@@ -47,9 +50,9 @@ const SHORT_TYPES: Record<string, string> = {
 };
 
 /** The short type tag beside an inspector value, e.g. "oid" or "arr[3]". */
-export function shortTypeName(value: unknown): string {
+export function shortTypeName(value: unknown, legacy: LegacyUuidEncoding = "raw"): string {
   if (Array.isArray(value)) return `arr[${value.length}]`;
-  const name = typeName(value);
+  const name = typeName(value, legacy);
   return SHORT_TYPES[name] ?? name.toLowerCase();
 }
 
@@ -100,7 +103,7 @@ export function formatDate(value: unknown, withSeconds = false): string | null {
 }
 
 /** A scalar's text without its BSON wrapper: bare hex or UUID, bare decimal, trimmed date. */
-function scalarText(value: unknown, withSeconds: boolean): string {
+function scalarText(value: unknown, withSeconds: boolean, legacy: LegacyUuidEncoding = "raw"): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -110,7 +113,7 @@ function scalarText(value: unknown, withSeconds: boolean): string {
     const inner = wrapped(value, tag);
     if (inner !== null) return inner;
   }
-  const uuid = uuidText(value);
+  const uuid = uuidText(value) ?? legacyUuidText(value, legacy);
   if (uuid !== null) return uuid;
   return bsonLiteral(value) ?? plainText(value);
 }
@@ -120,29 +123,29 @@ export function countLabel(n: number, noun: string): string {
 }
 
 /** A grid cell's text: dates to the minute, nested values as counts. */
-export function cellText(value: unknown): string {
+export function cellText(value: unknown, legacy: LegacyUuidEncoding = "raw"): string {
   if (Array.isArray(value)) return `[${countLabel(value.length, "item")}]`;
   const entries = childEntries(value);
   if (entries !== null) return `{${countLabel(entries.length, "field")}}`;
-  return scalarText(value, false);
+  return scalarText(value, false, legacy);
 }
 
 /** An inspector value's text: dates to the second, nested values summarized. */
-export function inspectorText(value: unknown): string {
+export function inspectorText(value: unknown, legacy: LegacyUuidEncoding = "raw"): string {
   if (Array.isArray(value)) return `[ ${countLabel(value.length, "item")} ]`;
   const entries = childEntries(value);
   if (entries !== null) return `{ ${countLabel(entries.length, "field")} }`;
-  return scalarText(value, true);
+  return scalarText(value, true, legacy);
 }
 
 /** A value's full text for a hover title; dates add how long ago they were. */
-export function valueTitle(value: unknown): string {
+export function valueTitle(value: unknown, legacy: LegacyUuidEncoding = "raw"): string {
   const iso = dateIso(value);
   if (iso !== null) {
     const relative = relativeTime(iso);
     return relative ? `${iso} (${relative})` : iso;
   }
-  return plainText(value);
+  return plainText(value, 400, legacy);
 }
 
 /** Identity of a document across result pages and edits: its `_id`, serialized. */

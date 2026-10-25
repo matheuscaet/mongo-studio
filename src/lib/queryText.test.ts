@@ -146,6 +146,14 @@ describe("shell helpers", () => {
     expect(parse(`ObjectId ( "${oid}" , )`)).toEqual({ $oid: oid });
   });
 
+  it("legacy UUIDs, as the driver that wrote them stored the bytes", () => {
+    const stored = { $binary: { base64: "N02eJg4nE2U4tOZS5E2nsg==", subType: "03" } };
+    expect(parse('LegacyJavaUUID("6513270e-269e-4d37-b2a7-4de452e6b438")')).toEqual(stored);
+    expect(parse('LegacyCSharpUUID("269e4d37270e651338b4e652e44da7b2")')).toEqual(stored);
+    expect(parse('LegacyPythonUUID("374d9e26-0e27-1365-38b4-e652e44da7b2")')).toEqual(stored);
+    expect(errorOf(() => parse('LegacyJavaUUID("nope")')).reason).toMatch(/32 hex characters/);
+  });
+
   it("ISODate, Date and new Date", () => {
     expect(parse('ISODate("2026-01-31T14:30:00Z")')).toEqual({ $date: "2026-01-31T14:30:00.000Z" });
     expect(parse('ISODate("2026-01-31")')).toEqual({ $date: "2026-01-31T00:00:00.000Z" });

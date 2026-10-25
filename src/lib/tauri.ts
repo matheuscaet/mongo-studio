@@ -5,6 +5,7 @@ import type {
   ConnectionProfile,
   ConnectionProfileInput,
   ConnectionProfileMeta,
+  LegacyUuidEncoding,
   ConnectionImportPreview,
   ConnectionTestResult,
   ConnectionsExportSummary,
@@ -45,6 +46,9 @@ export const api = {
 
   saveConnectionProfile: (input: ConnectionProfileInput) =>
     invoke<ConnectionProfileMeta>("save_connection_profile", { input }),
+
+  setLegacyUuidEncoding: (id: string, encoding: LegacyUuidEncoding | null) =>
+    invoke<ConnectionProfileMeta>("set_legacy_uuid_encoding", { id, encoding }),
 
   deleteConnectionProfile: (id: string) =>
     invoke<void>("delete_connection_profile", { id }),
