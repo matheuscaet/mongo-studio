@@ -6,6 +6,7 @@ import {
   emptyAdvancedOptions,
   type AuthMechanism,
   type ConnectionAdvancedOptions,
+  type LegacyUuidEncoding,
 } from "@/types/connection";
 import { DATA_FIELD, numberOrNull, type ConnectionSectionProps } from "./connectionFormTypes";
 import { Field } from "./Field";
@@ -13,6 +14,27 @@ import { FieldRow } from "./FieldRow";
 import { SwitchField } from "./SwitchField";
 
 const NEGOTIATE = "auto";
+const FROM_URI = "uri";
+
+const LEGACY_UUID_LABELS: Record<LegacyUuidEncoding, string> = {
+  raw: "Raw BinData",
+  python: "Python legacy",
+  java: "Java legacy",
+  csharp: "C# / .NET legacy",
+};
+
+/** The encoding a connection string's `uuidRepresentation` names, if any. */
+function uriLegacyUuid(input: ConnectionSectionProps["input"]): LegacyUuidEncoding | null {
+  if (input.source.kind !== "uri") return null;
+  const match = /[?&]uuidRepresentation=([^&#]*)/i.exec(input.source.uri);
+  if (!match) return null;
+  const named: Record<string, LegacyUuidEncoding> = {
+    javalegacy: "java",
+    csharplegacy: "csharp",
+    pythonlegacy: "python",
+  };
+  return named[match[1].toLowerCase()] ?? "raw";
+}
 
 type NumberKey = "connectTimeoutMs" | "serverSelectionTimeoutMs" | "maxPoolSize" | "minPoolSize";
 type TextKey = "appName" | "replicaSet" | "authSource";
@@ -47,6 +69,8 @@ export function AdvancedSection({ input, update }: ConnectionSectionProps) {
       />
     </Field>
   );
+
+  const fromUri = uriLegacyUuid(input);
 
   return (
     <>
@@ -85,6 +109,35 @@ export function AdvancedSection({ input, update }: ConnectionSectionProps) {
         {text("appName", "adv-app-name", "App name", "mongo-studio")}
         {number("minPoolSize", "adv-min-pool", "Min pool size", "1")}
       </FieldRow>
+      <Field
+        label="Legacy UUIDs (binary subtype 3)"
+        htmlFor="adv-legacy-uuid"
+        help={
+          <span>
+            How old drivers' UUIDs show in results. Filters take them back as{" "}
+            <span className="font-data">LegacyJavaUUID("…")</span> and the like. Display only: stored bytes never change.
+          </span>
+        }
+      >
+        <Select
+          value={advanced.legacyUuid ?? FROM_URI}
+          onValueChange={(v) => set({ legacyUuid: v === FROM_URI ? null : (v as LegacyUuidEncoding) })}
+        >
+          <SelectTrigger id="adv-legacy-uuid" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={FROM_URI}>
+              {fromUri ? `From connection string (${LEGACY_UUID_LABELS[fromUri]})` : "Not set (raw BinData)"}
+            </SelectItem>
+            {(Object.keys(LEGACY_UUID_LABELS) as LegacyUuidEncoding[]).map((encoding) => (
+              <SelectItem key={encoding} value={encoding}>
+                {LEGACY_UUID_LABELS[encoding]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </Field>
       <SwitchField
         label="Direct connection"
         description="Talk to this host only, without discovering the rest of the replica set."

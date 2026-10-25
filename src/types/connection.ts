@@ -1,3 +1,7 @@
+import type { LegacyUuidEncoding } from "../lib/bsonValue";
+
+export type { LegacyUuidEncoding };
+
 export type ConnectionSource =
   | { kind: "uri"; uri: string }
   | { kind: "manual"; host: string; port: number; srv: boolean };
@@ -42,6 +46,8 @@ export interface ConnectionAdvancedOptions {
   directConnection: boolean | null;
   authMechanism: AuthMechanism | null;
   authSource: string | null;
+  /** Null follows the connection string's `uuidRepresentation`, else raw. */
+  legacyUuid: LegacyUuidEncoding | null;
 }
 
 export interface ConnectionProfile {
@@ -84,6 +90,10 @@ export interface ConnectionProfileMeta {
   database: string | null;
   /** Whether a password is saved for it. */
   hasPassword: boolean;
+  /** How its legacy UUIDs show, the connection string's choice applied. */
+  legacyUuid: LegacyUuidEncoding;
+  /** Whether that was picked for it rather than left to the connection string. */
+  legacyUuidChosen: boolean;
 }
 
 export interface ConnectionTestResult {
@@ -160,6 +170,7 @@ export function emptyAdvancedOptions(): ConnectionAdvancedOptions {
     directConnection: null,
     authMechanism: null,
     authSource: null,
+    legacyUuid: null,
   };
 }
 

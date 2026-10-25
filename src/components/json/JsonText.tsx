@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { jsonTokens } from "../../lib/jsonText";
 import type { JsonTone } from "../../lib/jsonText";
+import { useLegacyUuid } from "./LegacyUuidContext";
 
 const TONE_CLASS: Record<JsonTone, string | undefined> = {
   key: "text-json-key",
@@ -20,7 +21,8 @@ interface JsonTextProps {
 
 /** A value as pretty-printed, shell-like text with syntax colors; selectable. */
 export function JsonText({ value, className }: JsonTextProps) {
-  const tokens = useMemo(() => jsonTokens(value), [value]);
+  const legacyUuid = useLegacyUuid();
+  const tokens = useMemo(() => jsonTokens(value, legacyUuid), [value, legacyUuid]);
   return (
     <pre
       className={cn(

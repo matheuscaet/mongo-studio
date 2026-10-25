@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { childEntries } from "../../lib/bsonValue";
 import { orderFields } from "../../lib/documentColumns";
 import { documentKey, shortTypeName } from "../../lib/bsonFormat";
+import { useLegacyUuid } from "./LegacyUuidContext";
 import { InlineValue } from "./InlineValue";
 import { JsonTreeNode } from "./JsonTreeNode";
 import { KvRow } from "./KvRow";
@@ -42,6 +43,7 @@ export function JsonTree({
   ...aria
 }: JsonTreeProps) {
   const docKey = useMemo(() => documentKey(doc), [doc]);
+  const legacyUuid = useLegacyUuid();
   const fields = childEntries(value);
   // a document's own fields: _id first, __v and the like last
   const entries = fields && path.length === 0 && !Array.isArray(value) ? orderFields(fields) : fields;
@@ -55,7 +57,7 @@ export function JsonTree({
     >
       {entries === null || entries.length === 0 ? (
         // a scalar, or an empty object/array: one bare row
-        <KvRow depth={depth} type={shortTypeName(value)}>
+        <KvRow depth={depth} type={shortTypeName(value, legacyUuid)}>
           <InlineValue value={value} wrap={!truncate} />
         </KvRow>
       ) : (

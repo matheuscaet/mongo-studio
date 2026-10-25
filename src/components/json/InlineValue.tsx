@@ -1,5 +1,6 @@
 import { inspectorText, valueTone } from "../../lib/bsonFormat";
 import type { ValueTone } from "../../lib/bsonFormat";
+import { useLegacyUuid } from "./LegacyUuidContext";
 
 const TONE_CLASS: Record<ValueTone, string> = {
   string: "text-json-string",
@@ -32,6 +33,7 @@ interface InlineValueProps {
  * BSON wrapper (the row's type tag names the type), strings quoted.
  */
 export function InlineValue({ value, wrap = true }: InlineValueProps) {
+  const legacyUuid = useLegacyUuid();
   const tone = valueTone(value);
   if (tone === "string") {
     const text = value as string;
@@ -41,5 +43,5 @@ export function InlineValue({ value, wrap = true }: InlineValueProps) {
       </span>
     );
   }
-  return <span className={TONE_CLASS[tone]}>{inspectorText(value)}</span>;
+  return <span className={TONE_CLASS[tone]}>{inspectorText(value, legacyUuid)}</span>;
 }

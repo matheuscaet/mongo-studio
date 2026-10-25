@@ -1,6 +1,7 @@
 import type { CollectionTab } from "../../store/sessionsStore";
 import { ResultViewToggle } from "../json/ResultViewToggle";
 import { resultViewKey } from "../../store/uiStore";
+import { LegacyUuidHint } from "./LegacyUuidHint";
 import { ResultsPager } from "./ResultsPager";
 import { RelatedMenu } from "./related/RelatedMenu";
 
@@ -42,6 +43,7 @@ export function ResultsHeader({ tab }: { tab: CollectionTab }) {
         <span className="tabular-nums max-sm:hidden">{queryMs.toLocaleString("en")} ms</span>
       )}
       <span className="flex-1" />
+      <LegacyUuidHint tab={tab} />
       <RelatedMenu tab={tab} />
       <ResultViewToggle viewKey={resultViewKey(tab.id, "documents")} />
       <ResultsPager tab={tab} total={total} />

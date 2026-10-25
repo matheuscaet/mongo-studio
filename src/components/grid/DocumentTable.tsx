@@ -4,6 +4,7 @@ import { Link } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { documentKey } from "../../lib/bsonFormat";
 import { columnsOf } from "../../lib/documentColumns";
+import { useLegacyUuid } from "../json/LegacyUuidContext";
 import { ValueEditContext } from "../json/ValueEditContext";
 import { DocumentTableRow } from "./DocumentTableRow";
 import { relatedTypeTag, type RelatedGrid } from "./RelatedTableCell";
@@ -62,7 +63,8 @@ export function DocumentTable({
   const detail = useRef<HTMLTableRowElement>(null);
   const scrollbar = useScrollbarWidth(scroller);
   const columnSource = columnsFrom ?? documents;
-  const columns = useMemo(() => columnsOf(columnSource), [columnSource]);
+  const legacyUuid = useLegacyUuid();
+  const columns = useMemo(() => columnsOf(columnSource, legacyUuid), [columnSource, legacyUuid]);
   const relatedCount = related?.columns.length ?? 0;
   const span = columns.length + 1 + relatedCount;
   const saved = useContext(ValueEditContext)?.saved ?? null;

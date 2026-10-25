@@ -6,6 +6,7 @@ import type {
   ConnectionProfileMeta,
   ConnectionTestResult,
   DatabaseInfo,
+  LegacyUuidEncoding,
   SecretBackendInfo,
 } from "../types/connection";
 
@@ -35,6 +36,8 @@ interface ConnectionsState {
   loadSecretBackendInfo: () => Promise<void>;
   saveProfile: (input: ConnectionProfileInput) => Promise<void>;
   deleteProfile: (id: string) => Promise<void>;
+  /** Sets how a connection's legacy UUIDs show; null leaves it to the connection string. */
+  setLegacyUuid: (id: string, encoding: LegacyUuidEncoding | null) => Promise<void>;
   testConnection: (input: ConnectionProfileInput) => Promise<void>;
   /** Opens a session for the connection, alongside any already open. */
   connect: (id: string) => Promise<void>;
@@ -105,6 +108,15 @@ export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
       await get().refreshProfiles();
     } catch (e) {
       set({ error: String(e), loading: false });
+    }
+  },
+
+  setLegacyUuid: async (id, encoding) => {
+    try {
+      const meta = await api.setLegacyUuidEncoding(id, encoding);
+      set((s) => ({ profiles: s.profiles.map((p) => (p.id === id ? meta : p)) }));
+    } catch (e) {
+      set({ error: String(e) });
     }
   },
 

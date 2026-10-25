@@ -60,6 +60,38 @@ pub struct SshTunnelOptions {
     pub private_key_has_passphrase: bool,
 }
 
+/// How binary subtype 3 values (legacy UUIDs) read. Subtype 3 never fixed a
+/// byte order, so each old driver wrote the 16 bytes its own way; `Raw`
+/// shows them as plain binary. Display only: stored bytes never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LegacyUuidEncoding {
+    #[default]
+    Raw,
+    Python,
+    Java,
+    Csharp,
+}
+
+impl LegacyUuidEncoding {
+    /// The encoding a `uuidRepresentation` URI option names, if any.
+    fn from_uri(uri: &str) -> Option<Self> {
+        let query = uri.split_once('?')?.1;
+        let query = query.split('#').next().unwrap_or(query);
+        let value = query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            key.eq_ignore_ascii_case("uuidRepresentation")
+                .then_some(value)
+        })?;
+        Some(match value.to_ascii_lowercase().as_str() {
+            "javalegacy" => Self::Java,
+            "csharplegacy" => Self::Csharp,
+            "pythonlegacy" => Self::Python,
+            _ => Self::Raw,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionAdvancedOptions {
@@ -74,6 +106,10 @@ pub struct ConnectionAdvancedOptions {
     pub direct_connection: Option<bool>,
     pub auth_mechanism: Option<AuthMechanism>,
     pub auth_source: Option<String>,
+    /// How legacy UUIDs show; `None` follows the connection string's
+    /// `uuidRepresentation`, else raw.
+    #[serde(default)]
+    pub legacy_uuid: Option<LegacyUuidEncoding>,
 }
 
 /// Persisted, non-secret connection metadata. Lives in `connections.json`.
@@ -130,6 +166,10 @@ pub struct ConnectionProfileMeta {
     pub database: Option<String>,
     /// Whether a password is saved for it, for the export picker.
     pub has_password: bool,
+    /// How its legacy UUIDs show, the connection string's choice applied.
+    pub legacy_uuid: LegacyUuidEncoding,
+    /// Whether that was picked for it rather than left to the connection string.
+    pub legacy_uuid_chosen: bool,
 }
 
 impl From<&ConnectionProfile> for ConnectionProfileMeta {
@@ -151,7 +191,21 @@ impl From<&ConnectionProfile> for ConnectionProfileMeta {
             summary,
             database: profile.database.clone(),
             has_password: profile.has_password,
+            legacy_uuid: profile.legacy_uuid(),
+            legacy_uuid_chosen: profile.advanced.legacy_uuid.is_some(),
         }
+    }
+}
+
+impl ConnectionProfile {
+    /// The legacy UUID encoding in effect: the one picked, else the
+    /// connection string's `uuidRepresentation`, else raw.
+    pub fn legacy_uuid(&self) -> LegacyUuidEncoding {
+        let from_uri = match &self.source {
+            ConnectionSource::Uri { uri } => LegacyUuidEncoding::from_uri(uri),
+            ConnectionSource::Manual { .. } => None,
+        };
+        self.advanced.legacy_uuid.or(from_uri).unwrap_or_default()
     }
 }
 
@@ -380,4 +434,32 @@ pub enum ExplainVerbosity {
     QueryPlanner,
     ExecutionStats,
     AllPlansExecution,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LegacyUuidEncoding;
+
+    #[test]
+    fn legacy_uuid_follows_the_uri_option() {
+        let read = LegacyUuidEncoding::from_uri;
+        assert_eq!(
+            read("mongodb://h/?uuidRepresentation=javaLegacy"),
+            Some(LegacyUuidEncoding::Java)
+        );
+        assert_eq!(
+            read("mongodb://h/db?w=1&UUIDREPRESENTATION=csharplegacy#x"),
+            Some(LegacyUuidEncoding::Csharp)
+        );
+        assert_eq!(
+            read("mongodb://h/?uuidRepresentation=pythonLegacy"),
+            Some(LegacyUuidEncoding::Python)
+        );
+        assert_eq!(
+            read("mongodb://h/?uuidRepresentation=standard"),
+            Some(LegacyUuidEncoding::Raw)
+        );
+        assert_eq!(read("mongodb://h/?w=1"), None);
+        assert_eq!(read("mongodb://h"), None);
+    }
 }

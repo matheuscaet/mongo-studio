@@ -1,4 +1,5 @@
 import { childEntries, isPlainObject } from "./bsonValue";
+import type { LegacyUuidEncoding } from "./bsonValue";
 import { typeName } from "./bsonFormat";
 
 export interface DocumentColumn {
@@ -39,7 +40,7 @@ export function orderFields<T>(entries: [string, T][]): [string, T][] {
 }
 
 /** The grid's columns: the union of the documents' top-level fields. */
-export function columnsOf(documents: unknown[]): DocumentColumn[] {
+export function columnsOf(documents: unknown[], legacy: LegacyUuidEncoding = "raw"): DocumentColumn[] {
   const order: string[] = [];
   const samples = new Map<string, unknown>();
   for (const doc of documents) {
@@ -57,5 +58,5 @@ export function columnsOf(documents: unknown[]): DocumentColumn[] {
   return order
     .map((key, i) => ({ key, i, rank: rank(key, samples.get(key)) }))
     .sort((a, b) => a.rank - b.rank || a.i - b.i)
-    .map(({ key }) => ({ key, type: typeName(samples.get(key)) }));
+    .map(({ key }) => ({ key, type: typeName(samples.get(key), legacy) }));
 }
