@@ -377,3 +377,13 @@ describe("compactQueryText", () => {
     expect(compactQueryText("{ a: 'open")).toBeNull();
   });
 });
+
+describe("Double", () => {
+  it("keeps a whole number a double", () => {
+    expect(parseQueryValue("Double(5)")).toEqual({ $numberDouble: "5" });
+    expect(parseQueryValue('Double("2.5")')).toEqual({ $numberDouble: "2.5" });
+    expect(parseQueryValue("Double(NaN)")).toEqual({ $numberDouble: "NaN" });
+    expect(parseQueryValue('Double("-Infinity")')).toEqual({ $numberDouble: "-Infinity" });
+    expect(() => parseQueryValue('Double("x")')).toThrow(/needs a number/);
+  });
+});
