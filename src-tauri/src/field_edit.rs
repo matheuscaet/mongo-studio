@@ -25,7 +25,13 @@ use crate::error::{AppError, AppResult};
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum FieldEdit {
     /// Removes a field, or an item of an array (the items after it move up).
-    Unset { path: Vec<String> },
+    /// `expected` is the value as the user saw it (relaxed Extended JSON):
+    /// if the field now holds something else - another item moved into that
+    /// index, say - nothing is removed.
+    Unset {
+        path: Vec<String>,
+        expected: Option<serde_json::Value>,
+    },
     /// Gives a field another name in the same object.
     Rename { path: Vec<String>, to: String },
     /// Adds `value` to the array at `path`: at `position`, or at the end.
@@ -47,6 +53,24 @@ pub struct FieldEditResult {
 }
 
 const CHANGED: &str = "The document changed since it was loaded. Run the query again and retry.";
+
+/// Whether a stored value is still the one the user saw. Both sides are
+/// relaxed Extended JSON; numbers compare by value, since the frontend sends
+/// the Double 5.0 back as 5.
+pub(crate) fn same_as_seen(stored: &Bson, seen: &serde_json::Value) -> bool {
+    fn eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        use serde_json::Value::*;
+        match (a, b) {
+            (Number(x), Number(y)) => x == y || x.as_f64() == y.as_f64(),
+            (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| eq(a, b)),
+            (Object(x), Object(y)) => {
+                x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| eq(v, w)))
+            }
+            _ => a == b,
+        }
+    }
+    eq(&stored.clone().into_relaxed_extjson(), seen)
+}
 
 fn gone() -> AppError {
     AppError::NotFound("the document no longer exists in the collection".to_string())
@@ -173,12 +197,15 @@ pub async fn edit_field(
     let id_filter = json_to_document(serde_json::json!({ "_id": id }))?;
 
     match edit {
-        FieldEdit::Unset { path } => {
+        FieldEdit::Unset { path, expected } => {
             let joined = field_path(&path)?;
             let current = load(&coll, &id_filter).await?;
             let previous = value_at(&current, &path)
                 .cloned()
                 .ok_or_else(|| field_gone(&path))?;
+            if expected.is_some_and(|seen| !same_as_seen(&previous, &seen)) {
+                return Err(AppError::Conflict(CHANGED.to_string()));
+            }
             let (holder_path, last) = path.split_at(path.len() - 1);
             let holder = value_at(&current, holder_path);
             let (filter, update) = match holder {
@@ -391,6 +418,26 @@ mod tests {
     }
 
     #[test]
+    fn same_as_seen_compares_numbers_by_value() {
+        let stored =
+            Bson::Document(doc! { "price": 5.0f64, "qty": 2i32, "n": 7i64, "tags": ["x"] });
+        let seen = serde_json::json!({ "qty": 2, "price": 5, "n": 7, "tags": ["x"] });
+        assert!(same_as_seen(&stored, &seen));
+        assert!(!same_as_seen(
+            &stored,
+            &serde_json::json!({ "qty": 3, "price": 5, "n": 7, "tags": ["x"] })
+        ));
+        assert!(!same_as_seen(
+            &stored,
+            &serde_json::json!({ "qty": 2, "price": 5, "n": 7 })
+        ));
+        assert!(!same_as_seen(
+            &Bson::String("a".into()),
+            &serde_json::json!("b")
+        ));
+    }
+
+    #[test]
     fn edits_deserialize_from_the_frontend_shape() {
         let edit: FieldEdit = serde_json::from_value(serde_json::json!({
             "kind": "insert", "path": ["items"], "value": { "sku": "C" }, "position": 1
@@ -463,7 +510,10 @@ mod live_tests {
             db,
             &name,
             id.clone(),
-            FieldEdit::Unset { path: p("items.0") },
+            FieldEdit::Unset {
+                expected: None,
+                path: p("items.0"),
+            },
         )
         .await
         .unwrap();
@@ -500,7 +550,10 @@ mod live_tests {
             db,
             &name,
             id.clone(),
-            FieldEdit::Unset { path: p("n") },
+            FieldEdit::Unset {
+                expected: None,
+                path: p("n"),
+            },
         )
         .await
         .unwrap();
@@ -579,10 +632,53 @@ mod live_tests {
             db,
             &name,
             id.clone(),
-            FieldEdit::Unset { path: p("items.5") },
+            FieldEdit::Unset {
+                expected: None,
+                path: p("items.5"),
+            },
         )
         .await;
         assert!(stale.is_err());
+        // an item moved into the index the user removes isn't removed
+        let seen = stored().await.get_array("items").unwrap()[0]
+            .clone()
+            .into_relaxed_extjson();
+        coll.update_one(
+            doc! { "_id": oid },
+            doc! { "$push": { "items": { "$each": ["front"], "$position": 0 } } },
+        )
+        .await
+        .unwrap();
+        let moved = edit_field(
+            &client,
+            db,
+            &name,
+            id.clone(),
+            FieldEdit::Unset {
+                path: p("items.0"),
+                expected: Some(seen.clone()),
+            },
+        )
+        .await;
+        assert!(matches!(moved, Err(AppError::Conflict(_))), "{moved:?}");
+        assert_eq!(
+            stored().await.get_array("items").unwrap()[0],
+            Bson::String("front".into())
+        );
+        // ... while the item the user saw, where they saw it, goes
+        edit_field(
+            &client,
+            db,
+            &name,
+            id.clone(),
+            FieldEdit::Unset {
+                path: p("items.1"),
+                expected: Some(seen),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored().await.get_array("items").unwrap().len(), 2);
         // a field changed by someone else in between isn't removed
         let before = stored().await;
         coll.update_one(doc! { "_id": oid }, doc! { "$set": { "notes": "changed" } })

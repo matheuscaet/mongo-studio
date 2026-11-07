@@ -31,7 +31,8 @@ function InspectorFooter() {
     <div className="flex shrink-0 flex-wrap gap-x-3 gap-y-1 border-t border-line-soft px-3 py-[7px] text-xs text-fg-3">
       {editable ? (
         <>
-          <span>Double-click a value to edit</span>
+          <span>Double-click a value or a name to edit</span>
+          <span>Right-click for more</span>
           <span>
             <Kbd>Enter</Kbd> saves
           </span>

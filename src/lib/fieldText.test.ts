@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fieldNameError, fieldText, parseFieldText } from "./fieldText";
+import { fieldNameError, fieldText, newObjectId, parseFieldText, valueAt } from "./fieldText";
 
 /** Canonical Extended JSON → text → what goes back to the backend. */
 function roundTrip(canonical: unknown): unknown {
@@ -111,5 +111,23 @@ describe("fieldNameError", () => {
     expect(fieldNameError("")).not.toBeNull();
     expect(fieldNameError("a.b")).not.toBeNull();
     expect(fieldNameError("$x")).not.toBeNull();
+  });
+});
+
+describe("valueAt / newObjectId", () => {
+  it("follows objects and array items", () => {
+    const doc = { items: [{ sku: "A" }, { tags: ["x"] }], a: { b: 1 } };
+    expect(valueAt(doc, ["items", "1", "tags", "0"])).toBe("x");
+    expect(valueAt(doc, ["a", "b"])).toBe(1);
+    expect(valueAt(doc, ["a", "b", "c"])).toBeUndefined();
+    expect(valueAt(doc, [])).toBe(doc);
+  });
+
+  it("makes 24-hex ObjectIds that start with the time", () => {
+    const a = newObjectId(1767225600000);
+    const b = newObjectId(1767225600000);
+    expect(a).toMatch(/^[0-9a-f]{24}$/);
+    expect(a.slice(0, 8)).toBe((1767225600).toString(16));
+    expect(a).not.toBe(b);
   });
 });

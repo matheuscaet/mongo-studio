@@ -24,7 +24,8 @@ export interface CollectionStats {
 
 /** A change to a document's shape (see src-tauri/src/field_edit.rs). */
 export type FieldEdit =
-  | { kind: "unset"; path: string[] }
+  /** `expected`: the value as the user saw it; anything else there now isn't removed. */
+  | { kind: "unset"; path: string[]; expected?: unknown }
   | { kind: "rename"; path: string[]; to: string }
   | { kind: "insert"; path: string[]; value: unknown; position?: number | null };
 

@@ -133,3 +133,30 @@ export function fieldNameError(name: string): string | null {
   if (name.startsWith("$")) return "A field name can't start with $";
   return null;
 }
+
+/** The value at `path` in a document, following array items by index. */
+export function valueAt(doc: unknown, path: string[]): unknown {
+  let current: unknown = doc;
+  for (const segment of path) {
+    if (Array.isArray(current)) current = current[Number(segment)];
+    else if (isPlainObject(current)) current = current[segment];
+    else return undefined;
+  }
+  return current;
+}
+
+let counter = Math.floor(Math.random() * 0xffffff);
+const machine = Array.from({ length: 5 }, () => Math.floor(Math.random() * 256));
+
+/** A new ObjectId as the drivers make one: seconds, 5 random bytes, a counter. */
+export function newObjectId(now = Date.now()): string {
+  counter = (counter + 1) % 0x1000000;
+  const bytes = [
+    ...[24, 16, 8, 0].map((shift) => (Math.floor(now / 1000) >>> shift) & 0xff),
+    ...machine,
+    (counter >> 16) & 0xff,
+    (counter >> 8) & 0xff,
+    counter & 0xff,
+  ];
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
