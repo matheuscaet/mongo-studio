@@ -14,6 +14,7 @@ use crate::connections_io;
 use crate::driver;
 use crate::error::{AppError, AppResult};
 use crate::export;
+use crate::field_edit;
 use crate::logging::{self, logged, Op};
 use crate::mcp_server::{ClientTarget, McpConfig, McpServer, McpStatus, RequestChoice};
 use crate::models::{
@@ -686,6 +687,75 @@ pub async fn update_field(
     let op = Op::new("updateField", &database, Some(&collection));
     on_session(&state, &session_id, op, async |client| {
         driver::update_field(client, &database, &collection, id, &path, value).await
+    })
+    .await
+}
+
+/// Removes, renames or inserts into a field of one document, found by
+/// `_id`. Returns the document as stored afterwards, and what was removed.
+#[tauri::command]
+pub async fn edit_field(
+    state: State<'_, AppState>,
+    session_id: String,
+    database: String,
+    collection: String,
+    id: serde_json::Value,
+    edit: field_edit::FieldEdit,
+) -> AppResult<field_edit::FieldEditResult> {
+    let op = Op::new("editField", &database, Some(&collection));
+    on_session(&state, &session_id, op, async |client| {
+        field_edit::edit_field(client, &database, &collection, id, edit).await
+    })
+    .await
+}
+
+/// One field of one document as canonical Extended JSON, for an editor
+/// that writes it back with every BSON type intact.
+#[tauri::command]
+pub async fn read_field(
+    state: State<'_, AppState>,
+    session_id: String,
+    database: String,
+    collection: String,
+    id: serde_json::Value,
+    path: Vec<String>,
+) -> AppResult<serde_json::Value> {
+    let op = Op::new("readField", &database, Some(&collection));
+    on_session(&state, &session_id, op, async |client| {
+        field_edit::read_field(client, &database, &collection, id, &path).await
+    })
+    .await
+}
+
+/// Deletes the documents with these `_id`s; returns how many went.
+#[tauri::command]
+pub async fn delete_documents(
+    state: State<'_, AppState>,
+    session_id: String,
+    database: String,
+    collection: String,
+    ids: Vec<serde_json::Value>,
+) -> AppResult<u64> {
+    let op = Op::new("deleteMany", &database, Some(&collection));
+    on_session(&state, &session_id, op, async |client| {
+        driver::delete_documents(client, &database, &collection, ids).await
+    })
+    .await
+}
+
+/// Deletes every document the filter matches; returns how many went.
+#[tauri::command]
+pub async fn delete_matching(
+    state: State<'_, AppState>,
+    session_id: String,
+    database: String,
+    collection: String,
+    filter: serde_json::Value,
+) -> AppResult<u64> {
+    let op = Op::new("deleteMany", &database, Some(&collection));
+    on_session(&state, &session_id, op, async |client| {
+        let result = driver::delete_many(client, &database, &collection, filter).await?;
+        Ok(result["deletedCount"].as_u64().unwrap_or(0))
     })
     .await
 }

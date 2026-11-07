@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Copy, ListChecks, SquareTerminal, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { RelationEnd } from "../../lib/relations";
 import { useRelatedPages } from "../../store/relatedStore";
@@ -14,6 +15,13 @@ import { RelatedSection } from "./related/RelatedSection";
 import { useRelatedSource } from "./related/relatedActions";
 import { useRelatedGrid } from "./related/useRelatedGrid";
 import { useDocumentSelection } from "./useDocumentSelection";
+import { askDeleteDocuments, canDeleteFrom, copyDocuments } from "./deleteDocuments";
+import type { MenuEntry } from "../common/ActionMenu";
+import { buildEditScript } from "../../lib/editScript";
+import { documentLabel } from "../../lib/bsonFormat";
+import { isPlainObject } from "../../lib/bsonValue";
+import { useConsoleStore } from "../../store/consoleStore";
+import { useSessionsStore } from "../../store/sessionsStore";
 import { useElementWidth } from "./useElementWidth";
 import { useMediaQuery } from "./useMediaQuery";
 
@@ -38,7 +46,8 @@ interface DocumentGridViewProps {
  * follow the document's, and the inspector lists the related documents.
  */
 export function DocumentGridView({ tab, documents }: DocumentGridViewProps) {
-  const [selected, select] = useDocumentSelection(tab.id, documents);
+  const selection = useDocumentSelection(tab.id, documents);
+  const { index: selected, select, picked } = selection;
   const pane = usePane();
   // only a find's documents are the collection's, as stored: aggregate output has no related documents
   const find = tab.resultsMode === "find";
@@ -50,6 +59,46 @@ export function DocumentGridView({ tab, documents }: DocumentGridViewProps) {
   const position = selected === null ? null : filtered ? indexes.indexOf(selected) : selected;
   const shownSelected = position === -1 ? null : position;
   const selectShown = useCallback((i: number) => select(indexes[i] ?? i), [select, indexes]);
+  const { pick, selectAll, clear } = selection;
+  const pickShown = useCallback((i: number, how: "toggle" | "range") => pick(indexes[i] ?? i, how), [pick, indexes]);
+  const pickedShown = useMemo(() => {
+    if (!filtered) return new Set(picked);
+    const at = new Map(indexes.map((page, i) => [page, i]));
+    return new Set(picked.map((p) => at.get(p)).filter((i): i is number => i !== undefined));
+  }, [picked, filtered, indexes]);
+  const pickedDocs = useMemo(() => picked.map((i) => documents[i]), [picked, documents]);
+  const deletable = canDeleteFrom(tab);
+  const deletePicked = useCallback(() => {
+    if (deletable) askDeleteDocuments(tab.id, pickedDocs);
+  }, [deletable, tab.id, pickedDocs]);
+  const rowMenu = useCallback(
+    (shown: number): MenuEntry[] => {
+      const n = pickedDocs.length;
+      const doc = documents[indexes[shown] ?? shown];
+      const label = n > 1 ? `${n} documents` : (documentLabel(doc) ?? `document ${shown + 1}`);
+      return [
+        { heading: `${tab.database}.${tab.collection} · ${label}` },
+        { label: n > 1 ? `Copy ${n} documents as JSON` : "Copy as JSON", icon: Copy, onSelect: () => void copyDocuments(pickedDocs) },
+        ...(n === 1 && isPlainObject(doc)
+          ? [{
+              label: "Edit in console (updateOne)",
+              icon: SquareTerminal,
+              onSelect: () => {
+                useConsoleStore.getState().setScript(tab.id, buildEditScript(doc, tab.collection));
+                useSessionsStore.getState().activateTab(tab.id);
+                useUiStore.getState().setMainTab(tab.id, "console");
+              },
+            }]
+          : []),
+        { label: "Select all on this page", icon: ListChecks, shortcut: "Ctrl A", onSelect: selectAll },
+        { separator: true },
+        deletable
+          ? { label: n > 1 ? `Delete ${n} documents…` : "Delete document…", icon: Trash2, danger: true, shortcut: "Del", onSelect: deletePicked }
+          : { label: "Delete document… · read-only results", icon: Trash2, disabled: true, onSelect: () => {} },
+      ];
+    },
+    [pickedDocs, documents, indexes, tab.id, tab.database, tab.collection, selectAll, deletable, deletePicked],
+  );
   const [expanded, setExpanded] = useState<number | null>(null);
   // A new result closes the open document: its row now holds another one.
   useEffect(() => setExpanded(null), [shown]);
@@ -60,6 +109,12 @@ export function DocumentGridView({ tab, documents }: DocumentGridViewProps) {
     related: view.grid,
     selectedIndex: shownSelected,
     onSelect: selectShown,
+    picked: pickedShown,
+    onPick: pickShown,
+    onSelectAll: selectAll,
+    onClearPicks: clear,
+    onDelete: deletable ? deletePicked : undefined,
+    rowMenu,
   };
   const chips = <RelatedChips tabId={tab.id} ends={find ? related.ends : NO_ENDS} />;
   const storedWidth = useUiStore((s) => s.inspectorWidth);
@@ -118,6 +173,9 @@ export function DocumentGridView({ tab, documents }: DocumentGridViewProps) {
         {!stacked && <InspectorResizer width={width} />}
         <DocumentInspector
           doc={selected === null ? undefined : documents[selected]}
+          picked={pickedDocs.length > 1 ? pickedDocs : undefined}
+          pickedIndexes={picked}
+          onClearPicks={clear}
           collectionName={tab.collection}
           tabId={tab.id}
           related={

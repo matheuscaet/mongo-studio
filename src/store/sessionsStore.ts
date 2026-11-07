@@ -4,6 +4,7 @@ import { useUiStore } from "./uiStore";
 import { forgetRelatedPages } from "./relatedStore";
 import { useSettingsStore } from "./settingsStore";
 import { parseOptionalQueryObject, parseQueryArray, parseQueryObject } from "../lib/queryText";
+import { documentKey } from "../lib/bsonFormat";
 import type { CollectionInfo } from "../types/connection";
 import type { CollectionStats, QueryResultPage } from "../types/query";
 
@@ -39,6 +40,11 @@ export interface CollectionTab {
    * editable even when it has an _id.
    */
   resultsMode: QueryMode | null;
+  /**
+   * The filter text that produced find `results`: what "delete the
+   * documents matching the filter" deletes, even after the field is edited.
+   */
+  resultsFilter?: string | null;
   /** How long the query behind `results` took, round trip included, in ms. */
   queryMs: number | null;
   mode: QueryMode;
@@ -164,6 +170,11 @@ interface SessionsState {
   cancelQuery: (id: string) => void;
   /** Swaps in a document as stored after an edit, matched on _id. */
   replaceDocument: (id: string, updated: unknown) => void;
+  /**
+   * Takes documents deleted on the server out of the results, matched on
+   * `documentKey`, and `deleted` off the collection's count.
+   */
+  removeDocuments: (id: string, keys: string[], deleted: number) => void;
   /** Forgets a connection going away: its tabs and its sidebar state. */
   closeConnection: (connectionId: string) => void;
   /** Puts back the last session's tabs, dormant, before any tab is open. */
@@ -439,7 +450,14 @@ export const useSessionsStore = create<SessionsState>((set, get) => {
             skip: tab.skip,
           }, runId);
           if (current()) {
-            patchTab(id, { results, resultsMode: "find", queryMs: elapsed(), loading: false, runId: null });
+            patchTab(id, {
+              results,
+              resultsMode: "find",
+              resultsFilter: tab.filterText,
+              queryMs: elapsed(),
+              loading: false,
+              runId: null,
+            });
           }
         }
       } catch (e) {
@@ -470,6 +488,20 @@ export const useSessionsStore = create<SessionsState>((set, get) => {
             JSON.stringify((d as { _id?: unknown } | null)?._id) === key ? updated : d,
           ),
         },
+      });
+    },
+
+    removeDocuments: (id, keys, deleted) => {
+      const tab = collectionTab(id);
+      if (!tab?.results) return;
+      const gone = new Set(keys);
+      const documents = tab.results.documents.filter((d) => {
+        const key = documentKey(d);
+        return key === null || !gone.has(key);
+      });
+      patchTab(id, {
+        results: { ...tab.results, documents, returned: documents.length },
+        stats: tab.stats ? { ...tab.stats, documentCount: Math.max(0, tab.stats.documentCount - deleted) } : null,
       });
     },
 

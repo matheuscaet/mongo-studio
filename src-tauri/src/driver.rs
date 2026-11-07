@@ -684,6 +684,26 @@ pub async fn delete_one(
     Ok(serde_json::json!({ "deletedCount": result.deleted_count }))
 }
 
+/// Deletes the documents with these `_id`s (Extended JSON); returns how many
+/// went. Fewer than asked means some were already gone.
+pub async fn delete_documents(
+    client: &Client,
+    db: &str,
+    collection: &str,
+    ids: Vec<serde_json::Value>,
+) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Err(AppError::InvalidInput("no documents to delete".to_string()));
+    }
+    let filter = json_to_document(serde_json::json!({ "_id": { "$in": ids } }))?;
+    let result = client
+        .database(db)
+        .collection::<Document>(collection)
+        .delete_many(filter)
+        .await?;
+    Ok(result.deleted_count)
+}
+
 /// Inserts every document of a JSON array; `insertedIds` keeps their order.
 pub async fn insert_many(
     client: &Client,

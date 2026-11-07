@@ -14,6 +14,7 @@
  *   NumberLong(…), Long(…)              → { $numberLong }
  *   NumberInt(…), Int32(…)              → { $numberInt }
  *   NumberDecimal("…"), Decimal128("…") → { $numberDecimal }
+ *   Double(…)                           → { $numberDouble } (keeps 5 a double)
  *   UUID("…")                           → { $uuid }
  *   LegacyJavaUUID("…"), LegacyCSharpUUID("…"), LegacyPythonUUID("…")
  *                                       → { $binary } subtype 3, in that
@@ -298,6 +299,7 @@ const HELPERS = [
   "Int32",
   "NumberDecimal",
   "Decimal128",
+  "Double",
   "UUID",
   "LegacyJavaUUID",
   "LegacyCSharpUUID",
@@ -583,6 +585,24 @@ function helper(name: Helper, call: Call): unknown {
         failAt(token, `${name} needs a decimal number, e.g. ${name}("10.25")`);
       }
       return { $numberDecimal: text.trim() };
+    }
+
+    case "Double": {
+      arity(call, 1, `${name}(5)`);
+      const [{ value, token }] = call.args;
+      // NaN and Infinity already read as doubles
+      if (value !== null && typeof value === "object" && typeof (value as { $numberDouble?: unknown }).$numberDouble === "string") {
+        return value;
+      }
+      let n: number | null = null;
+      if (typeof value === "number") n = value;
+      else if (typeof value === "string" && DECIMAL_TEXT.test(value.trim())) {
+        n = Number(value.trim().replace(/^([+-]?)inf$/i, "$1Infinity"));
+      }
+      if (n === null) return failAt(token, `${name} needs a number, e.g. ${name}(5)`);
+      if (Number.isNaN(n)) return { $numberDouble: "NaN" };
+      if (!Number.isFinite(n)) return { $numberDouble: n > 0 ? "Infinity" : "-Infinity" };
+      return { $numberDouble: Object.is(n, -0) ? "-0.0" : String(n) };
     }
 
     case "UUID": {

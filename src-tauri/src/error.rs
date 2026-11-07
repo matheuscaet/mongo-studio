@@ -14,6 +14,10 @@ pub enum AppError {
     NotFound(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The data changed under an edit, or the edit would clobber something:
+    /// the message says what to do, so it carries no prefix.
+    #[error("{0}")]
+    Conflict(String),
     #[error("session {0} is not connected")]
     SessionNotFound(String),
     /// Stopped by the user before it finished.

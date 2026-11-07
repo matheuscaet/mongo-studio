@@ -10,6 +10,7 @@ import { DocumentTableRow } from "./DocumentTableRow";
 import { relatedTypeTag, type RelatedGrid } from "./RelatedTableCell";
 import { useScrollbarWidth } from "./useScrollbarWidth";
 import { useVirtualRows } from "./useVirtualRows";
+import { RowContextMenu, type MenuEntry } from "../common/ActionMenu";
 
 const HEADER_HEIGHT = 30;
 
@@ -18,6 +19,19 @@ interface DocumentTableProps {
   /** Selection, for a grid beside an inspector; without `onSelect` rows can't be selected. */
   selectedIndex?: number | null;
   onSelect?: (index: number) => void;
+  /**
+   * Several rows: those picked besides the selected one (shown indexes).
+   * With `onPick`, Ctrl/Cmd-click toggles a row and Shift-click picks a
+   * range; Ctrl+A picks every row, Esc goes back to the selected row alone.
+   */
+  picked?: ReadonlySet<number>;
+  onPick?: (index: number, how: "toggle" | "range") => void;
+  onSelectAll?: () => void;
+  onClearPicks?: () => void;
+  /** The Delete key, on the picked rows. */
+  onDelete?: () => void;
+  /** A row's right-click menu, built when it opens. */
+  rowMenu?: (index: number) => MenuEntry[];
   /** Fade the right edge where the grid meets a panel beside it. */
   fadeRight?: boolean;
   /**
@@ -49,6 +63,12 @@ export function DocumentTable({
   documents,
   selectedIndex = null,
   onSelect,
+  picked,
+  onPick,
+  onSelectAll,
+  onClearPicks,
+  onDelete,
+  rowMenu,
   fadeRight = false,
   expandedIndex = null,
   onToggleExpand,
@@ -105,8 +125,29 @@ export function DocumentTable({
     [onSelect, reveal],
   );
 
+  const multi = (picked?.size ?? 0) > 1;
+  // the row right-clicked last, for the menu that opens on it
+  const menuRow = useRef<number | null>(null);
+
   function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
     if (!onSelect || documents.length === 0) return;
+    if (e.target === e.currentTarget) {
+      if (e.key === "Delete" && onDelete) {
+        e.preventDefault();
+        onDelete();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && onSelectAll) {
+        e.preventDefault();
+        onSelectAll();
+        return;
+      }
+      if (e.key === "Escape" && multi && onClearPicks) {
+        e.preventDefault();
+        onClearPicks();
+        return;
+      }
+    }
     if (expandable && e.target === e.currentTarget) {
       // Enter or Space opens the selected document under its row; Esc closes it.
       if ((e.key === "Enter" || e.key === " ") && selectedIndex !== null) {
@@ -179,7 +220,19 @@ export function DocumentTable({
             ))}
           </tr>
         </thead>
-        <tbody>
+        <MaybeRowMenu
+          menu={rowMenu}
+          row={menuRow}
+          tbody={
+        <tbody
+          onContextMenu={(e) => {
+            const row = (e.target as HTMLElement).closest("tr[data-row]");
+            const index = row ? Number((row as HTMLElement).dataset.row) : selectedIndex;
+            menuRow.current = index;
+            // a row outside the selection becomes the selection, as in a file manager
+            if (index !== null && index !== selectedIndex && !picked?.has(index)) onSelect?.(index);
+          }}
+        >
           {rows.padTop > 0 && (
             <tr aria-hidden style={{ height: rows.padTop }}>
               <td colSpan={span} className="p-0" />
@@ -196,6 +249,9 @@ export function DocumentTable({
                 index={i}
                 columns={columns}
                 selected={i === selectedIndex}
+                picked={picked?.has(i) ?? false}
+                multi={multi}
+                onPick={onPick}
                 flashing={flashing}
                 onSelect={onSelect ? select : undefined}
                 onToggle={expandable ? onToggleExpand : undefined}
@@ -221,6 +277,8 @@ export function DocumentTable({
             </tr>
           )}
         </tbody>
+          }
+        />
         {related && relatedCount > 0 && (
           <tfoot>
             <tr className="[&>td]:sticky [&>td]:bottom-0 [&>td]:h-[26px] [&>td]:border-t [&>td]:border-r [&>td]:border-line [&>td]:border-r-line-soft [&>td]:bg-panel">
@@ -252,5 +310,21 @@ export function DocumentTable({
         />
       )}
     </div>
+  );
+}
+
+/** The table body, with a right-click menu for the row under the pointer when there is one. */
+function MaybeRowMenu({
+  menu,
+  row,
+  tbody,
+}: {
+  menu?: (index: number) => MenuEntry[];
+  row: { current: number | null };
+  tbody: ReactNode;
+}) {
+  if (!menu) return tbody;
+  return (
+    <RowContextMenu entries={() => (row.current === null ? [] : menu(row.current))}>{tbody}</RowContextMenu>
   );
 }

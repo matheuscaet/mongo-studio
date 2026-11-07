@@ -1,4 +1,5 @@
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
+import { Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { childEntries } from "../../lib/bsonValue";
 import { orderFields } from "../../lib/documentColumns";
@@ -7,6 +8,9 @@ import { useLegacyUuid } from "./LegacyUuidContext";
 import { InlineValue } from "./InlineValue";
 import { JsonTreeNode } from "./JsonTreeNode";
 import { KvRow } from "./KvRow";
+import { openFieldEdit, useFieldEditMode } from "./fieldEditStore";
+import { NewFieldRow } from "./NewFieldRow";
+import { ValueEditContext } from "./ValueEditContext";
 
 interface JsonTreeProps {
   value: unknown;
@@ -48,6 +52,11 @@ export function JsonTree({
   // a document's own fields: _id first, __v and the like last
   const entries = fields && path.length === 0 && !Array.isArray(value) ? orderFields(fields) : fields;
   const label = aria["aria-label"];
+  // a document's own fields end with "Add field" where it can be written
+  const editor = useContext(ValueEditContext);
+  const root = path.length === 0 && entries !== null && !Array.isArray(value);
+  const adding = useFieldEditMode(root ? docKey : null, path) === "add";
+  const canAdd = root && editor !== null && docKey !== null;
 
   return (
     <div
@@ -76,6 +85,20 @@ export function JsonTree({
           />
         ))
       )}
+      {canAdd &&
+        (adding ? (
+          <NewFieldRow doc={doc} path={path} depth={depth} />
+        ) : (
+          <button
+            type="button"
+            className="flex h-6 w-full items-center gap-1.5 text-left font-sans text-sm text-fg-3 hover:bg-row-hover hover:text-fg"
+            style={{ paddingLeft: 28 + depth * 16 }}
+            onClick={() => docKey !== null && openFieldEdit(docKey, path, "add")}
+          >
+            <Plus className="size-3" />
+            Add field
+          </button>
+        ))}
     </div>
   );
 }

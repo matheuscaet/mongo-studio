@@ -1,6 +1,9 @@
+import { useContext } from "react";
 import { cn } from "@/lib/utils";
-import { valueTitle } from "../../lib/bsonFormat";
-import { editText } from "../../lib/valueEdit";
+import { documentKey, valueTitle } from "../../lib/bsonFormat";
+import { editText, isEditablePath } from "../../lib/valueEdit";
+import { openFieldEdit } from "../json/fieldEditStore";
+import { ValueEditContext } from "../json/ValueEditContext";
 import { useValueEdit } from "../json/useValueEdit";
 import { ValueInput } from "../json/ValueInput";
 import { useLegacyUuid } from "../json/LegacyUuidContext";
@@ -18,6 +21,9 @@ interface DocumentTableCellProps {
 export function DocumentTableCell({ doc, field, value, className }: DocumentTableCellProps) {
   const edit = useValueEdit(value, doc, [field]);
   const legacyUuid = useLegacyUuid();
+  // an object, an array or a value with no one-line editor opens as JSON in the document's tree
+  const editor = useContext(ValueEditContext);
+  const asJson = !edit.editable && value !== undefined && editor !== null && isEditablePath([field]);
   const base = "h-6 max-w-[280px] border-r border-b border-line-soft";
 
   if (edit.editing && edit.kind !== null) {
@@ -40,7 +46,7 @@ export function DocumentTableCell({ doc, field, value, className }: DocumentTabl
       className={cn(
         base,
         "overflow-hidden px-2.5 text-ellipsis whitespace-nowrap",
-        edit.editable && "cursor-text",
+        (edit.editable || asJson) && "cursor-text",
         className,
       )}
       title={value === undefined ? undefined : valueTitle(value, legacyUuid)}
@@ -50,7 +56,13 @@ export function DocumentTableCell({ doc, field, value, className }: DocumentTabl
               e.stopPropagation();
               edit.begin();
             }
-          : undefined
+          : asJson
+            ? () => {
+                const key = documentKey(doc);
+                window.getSelection()?.removeAllRanges();
+                if (key !== null) openFieldEdit(key, [field], "json");
+              }
+            : undefined
       }
     >
       <BsonCell value={value} />
