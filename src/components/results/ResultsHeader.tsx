@@ -14,7 +14,8 @@ import { RelatedMenu } from "./related/RelatedMenu";
 /** A find with no filter matches the whole collection, whose count the stats have. */
 function knownTotal(tab: CollectionTab): number | null {
   if (tab.resultsMode !== "find" || !tab.stats) return null;
-  const filter = tab.filterText.replace(/\s/g, "");
+  // the filter that produced the results, not the field's text since
+  const filter = (tab.resultsFilter ?? tab.filterText).replace(/\s/g, "");
   return filter === "" || filter === "{}" ? tab.stats.documentCount : null;
 }
 

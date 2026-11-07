@@ -83,11 +83,14 @@ function DeleteDialog({ request }: { request: DeleteRequest }) {
       }
     >
       <div className="flex flex-col gap-3">
-        <p className="m-0 flex flex-wrap items-center gap-x-1 text-fg-2">
-          <TriangleAlert aria-hidden className="mr-1 size-4 text-danger" />
-          From <b className="font-mono font-medium text-fg">{`${tab.database}.${tab.collection}`}</b> on
-          <ConnectionChip name={tab.connection.name} color={color} size="dot" />
-          <b className="font-medium text-fg">{tab.connection.name}</b>. Deleted documents can't be brought back.
+        <p className="m-0 text-fg-2">
+          <TriangleAlert aria-hidden className="mr-1.5 inline size-4 align-[-3px] text-danger" />
+          From <b className="font-mono font-medium text-fg">{`${tab.database}.${tab.collection}`}</b> on{" "}
+          <span className="inline-flex items-center gap-1 align-baseline">
+            <ConnectionChip name={tab.connection.name} color={color} size="dot" />
+            <b className="font-medium text-fg">{tab.connection.name}</b>
+          </span>
+          . Deleted documents can't be brought back.
         </p>
 
         {request.kind === "documents" ? (
