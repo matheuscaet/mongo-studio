@@ -15,6 +15,8 @@ import type {
 } from "../types/connection";
 import type {
   CollectionStats,
+  FieldEdit,
+  FieldEditResult,
   FindQueryInput,
   QueryResultPage,
 } from "../types/query";
@@ -110,6 +112,27 @@ export const api = {
     value: unknown,
   ) =>
     invoke<unknown>("update_field", { sessionId, database, collection, id, path, value }),
+
+  /** Removes, renames or inserts into a field of one document; returns it as stored, and what was removed. */
+  editField: (
+    sessionId: string,
+    database: string,
+    collection: string,
+    id: unknown,
+    edit: FieldEdit,
+  ) => invoke<FieldEditResult>("edit_field", { sessionId, database, collection, id, edit }),
+
+  /** One field of one document as canonical Extended JSON (every number keeps its type). */
+  readField: (sessionId: string, database: string, collection: string, id: unknown, path: string[]) =>
+    invoke<unknown>("read_field", { sessionId, database, collection, id, path }),
+
+  /** Deletes the documents with these _ids; resolves to how many went. */
+  deleteDocuments: (sessionId: string, database: string, collection: string, ids: unknown[]) =>
+    invoke<number>("delete_documents", { sessionId, database, collection, ids }),
+
+  /** Deletes every document the filter matches; resolves to how many went. */
+  deleteMatching: (sessionId: string, database: string, collection: string, filter: unknown) =>
+    invoke<number>("delete_matching", { sessionId, database, collection, filter }),
 
   runAggregate: (
     sessionId: string,

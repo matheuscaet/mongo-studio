@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Check, Copy, SquareTerminal } from "lucide-react";
+import { Check, Copy, SquareTerminal, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useConsoleStore } from "../../store/consoleStore";
-import { useSessionsStore } from "../../store/sessionsStore";
+import { TabKind, useSessionsStore } from "../../store/sessionsStore";
+import { cn } from "@/lib/utils";
 import { useUiStore } from "../../store/uiStore";
 import { buildEditScript } from "../../lib/editScript";
+import { askDeleteDocuments, canDeleteFrom } from "../results/deleteDocuments";
 
 interface DocumentActionsProps {
   doc: unknown;
@@ -22,11 +24,14 @@ function Action({
   size,
   onClick,
   children,
+  danger = false,
 }: {
   label: string;
   size: "icon" | "icon-xs";
   onClick: () => void;
   children: ReactNode;
+  /** Turns red on hover. */
+  danger?: boolean;
 }) {
   return (
     <Tooltip>
@@ -35,7 +40,7 @@ function Action({
           variant="ghost"
           size={size}
           aria-label={label}
-          className={size === "icon" ? "[&_svg]:size-3.5" : undefined}
+          className={cn(size === "icon" && "[&_svg]:size-3.5", danger && "hover:text-danger")}
           onClick={(e) => {
             e.stopPropagation();
             onClick();
@@ -49,10 +54,14 @@ function Action({
   );
 }
 
-/** Copy-as-JSON and edit-in-console, for the inspector and the tree view. */
+/** Copy-as-JSON, edit-in-console and delete, for the inspector, the inline document and the tree view. */
 export function DocumentActions({ doc, collectionName, tabId, size = "icon" }: DocumentActionsProps) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const deletable = useSessionsStore((s) => {
+    const tab = s.tabs.find((t) => t.id === tabId);
+    return tab?.kind === TabKind.Collection && canDeleteFrom(tab);
+  });
   useEffect(() => () => clearTimeout(timer.current), []);
 
   async function handleCopy() {
@@ -82,6 +91,11 @@ export function DocumentActions({ doc, collectionName, tabId, size = "icon" }: D
       <Action label="Edit in console (updateOne)" size={size} onClick={handleEdit}>
         <SquareTerminal />
       </Action>
+      {deletable && (
+        <Action label="Delete document…" size={size} danger onClick={() => askDeleteDocuments(tabId, [doc])}>
+          <Trash2 />
+        </Action>
+      )}
     </>
   );
 }
