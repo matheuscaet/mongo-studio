@@ -6,6 +6,7 @@ mod driver;
 mod ejson;
 mod error;
 mod export;
+mod field_edit;
 mod logging;
 mod mcp_server;
 mod models;
@@ -59,6 +60,10 @@ pub fn run() {
             commands::run_find,
             commands::run_aggregate,
             commands::update_field,
+            commands::edit_field,
+            commands::read_field,
+            commands::delete_documents,
+            commands::delete_matching,
             commands::count_documents,
             commands::run_script,
             commands::cancel_script,
