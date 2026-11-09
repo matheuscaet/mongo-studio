@@ -2137,6 +2137,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
             always: HashMap::new(),
+            alerts: Default::default(),
         }
     }
 
@@ -2563,6 +2564,7 @@ mod live_tests {
                 caps,
                 connections: HashMap::from([("live".to_string(), Level::Write)]),
                 always: HashMap::new(),
+                alerts: Default::default(),
             },
         );
         (host, inner)

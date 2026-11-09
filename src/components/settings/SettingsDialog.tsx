@@ -17,7 +17,7 @@ const SECTIONS: { id: SettingsSection; label: string; icon: ReactNode; keys: str
   { id: "console", label: "Console", icon: <SquareTerminal />, keys: "mongosh engine shell script download", body: () => <ConsoleSettings /> },
   { id: "connections", label: "Connections", icon: <Plug />, keys: "import export compass nosqlbooster", body: () => <ConnectionsSettings /> },
   { id: "assistant", label: "Assistant", icon: <Sparkles />, keys: "ai claude codex agent model", body: () => <AssistantSettings /> },
-  { id: "mcp", label: "MCP server", icon: <Server />, keys: "mcp clients cursor claude codex vscode permissions token port", body: () => <McpSettings /> },
+  { id: "mcp", label: "MCP server", icon: <Server />, keys: "mcp clients cursor claude codex vscode permissions token port sound notification alert focus request", body: () => <McpSettings /> },
 ];
 
 interface SettingsDialogProps {

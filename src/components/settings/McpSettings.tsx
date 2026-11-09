@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Check, Copy, Eye, EyeOff, Lock, Sparkles, X } from "lucide-react";
+import { Bot, Check, Copy, Eye, EyeOff, Lock, Sparkles, Volume2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { ConnectionChip } from "@/components/ui/ConnectionChip";
@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { SegmentedControl, type SegmentOption } from "@/components/ui/segmented-control";
 import { connectionColor } from "@/lib/connectionColor";
 import { api } from "@/lib/tauri";
+import { playChime } from "@/lib/attention";
 import { cn } from "@/lib/utils";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { useMcpStore } from "../../store/mcpStore";
@@ -410,6 +411,36 @@ function Activity() {
   );
 }
 
+/** How Mongo Studio calls for attention when a request set to Ask arrives. */
+function RequestAlerts() {
+  const alerts = useSettingsStore((s) => s.mcpAlerts);
+  const setAlerts = useSettingsStore((s) => s.setMcpAlerts);
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <SwitchField
+            label="Play a sound"
+            description="A short chime, so you hear it while you're in another window; the notification's sound when Mongo Studio is minimized."
+            checked={alerts.sound}
+            onCheckedChange={(sound) => setAlerts({ sound })}
+          />
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => void playChime(true)}>
+          <Volume2 />
+          Play it
+        </Button>
+      </div>
+      <SwitchField
+        label="Bring Mongo Studio to the front"
+        description="Shows and focuses the window. Where the system won't let an app take the focus, like Linux on Wayland, a desktop notification opens it instead; elsewhere its taskbar entry flashes."
+        checked={alerts.focus}
+        onCheckedChange={(focus) => setAlerts({ focus })}
+      />
+    </div>
+  );
+}
+
 export function McpSettings() {
   const mcp = useSettingsStore((s) => s.mcp);
   const setMcp = useSettingsStore((s) => s.setMcp);
@@ -506,6 +537,9 @@ export function McpSettings() {
             })}
           </RowGroup>
         ))}
+
+        <SectionTitle>When a request waits for you</SectionTitle>
+        <RequestAlerts />
 
         <SectionTitle>Connections clients may use</SectionTitle>
         <ConnectionAccess />

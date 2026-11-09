@@ -206,6 +206,28 @@ pub(crate) async fn ask(inner: &Inner, client: &ClientSession, request: &Request
             at: now_ms(),
         },
     );
+    let target = match (&request.connection_name, &request.database) {
+        (Some(conn), _) => format!(" on {conn}"),
+        _ => String::new(),
+    };
+    inner.call_attention(
+        &format!("{} is waiting for you", client.name),
+        &format!(
+            "{}{target}. Allow or deny it in Mongo Studio.",
+            request.title
+        ),
+    );
+    let answer = wait_for_answer(inner, request, &request_id, rx).await;
+    inner.dismiss_attention();
+    answer
+}
+
+async fn wait_for_answer(
+    inner: &Inner,
+    request: &Request,
+    request_id: &str,
+    rx: oneshot::Receiver<RequestChoice>,
+) -> Answer {
     match tokio::time::timeout(inner.ask_timeout, rx).await {
         Ok(Ok(RequestChoice::Once)) => Answer::Once,
         Ok(Ok(RequestChoice::Always)) => {
@@ -220,14 +242,8 @@ pub(crate) async fn ask(inner: &Inner, client: &ClientSession, request: &Request
         Ok(Err(_)) => Answer::Closed,
         Err(_) => {
             // Gone already when an answer raced the timeout.
-            if inner
-                .approvals
-                .lock()
-                .unwrap()
-                .remove(&request_id)
-                .is_some()
-            {
-                emit_closed(inner, &request_id, "timeout");
+            if inner.approvals.lock().unwrap().remove(request_id).is_some() {
+                emit_closed(inner, request_id, "timeout");
             }
             Answer::Timeout
         }
@@ -321,6 +337,7 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
             always: HashMap::new(),
+            alerts: Default::default(),
         }
     }
 
