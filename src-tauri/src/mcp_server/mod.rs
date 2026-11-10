@@ -75,6 +75,26 @@ pub enum Level {
     Write,
 }
 
+/// How the app calls the user back when a request set to Ask waits
+/// (Settings › MCP server). Both on unless the frontend says otherwise.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAlerts {
+    /// A sound: the app's chime, or the desktop notification's.
+    pub sound: bool,
+    /// Bring the window forward, or ask for it with a notification.
+    pub focus: bool,
+}
+
+impl Default for McpAlerts {
+    fn default() -> Self {
+        Self {
+            sound: true,
+            focus: true,
+        }
+    }
+}
+
 /// The settings the frontend pushes: whether the server runs, where, and
 /// what clients may do. Capability ids: browse, read, write, ddl, script,
 /// connList, connEdit, connDelete, saveScript, relRead, relEdit.
@@ -93,6 +113,8 @@ pub struct McpConfig {
     /// about a connection (creating connections, saving scripts...).
     #[serde(default)]
     pub always: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub alerts: McpAlerts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,11 +171,25 @@ pub(crate) trait Host: Send + Sync + 'static {
     fn relations(&self) -> &RelationsStore;
     /// The sidebar's folder tree (the frontend's own JSON), or null.
     fn sidebar_layout(&self) -> Value;
+    /// A request waits for the user: bring the window forward, or show a
+    /// desktop notification that does. Done here rather than in the
+    /// webview, which a minimized window may keep suspended.
+    fn call_attention(&self, _alerts: McpAlerts, _title: &str, _body: &str) {}
+    /// Nothing waits any more: take the notification away.
+    fn dismiss_attention(&self) {}
 }
 
 impl Host for tauri::AppHandle {
     fn emit(&self, event: &str, payload: Value) {
         let _ = tauri::Emitter::emit(self, event, payload);
+    }
+
+    fn call_attention(&self, alerts: McpAlerts, title: &str, body: &str) {
+        crate::attention::call_attention(self, alerts.focus, alerts.sound, title, body);
+    }
+
+    fn dismiss_attention(&self) {
+        crate::attention::dismiss_attention();
     }
 
     fn app_state(&self) -> &AppState {
@@ -225,6 +261,20 @@ impl Inner {
     fn emit<T: Serialize>(&self, event: &str, payload: &T) {
         if let Ok(value) = serde_json::to_value(payload) {
             self.host.emit(event, value);
+        }
+    }
+
+    /// Calls the user back for a waiting request, as the settings say.
+    fn call_attention(&self, title: &str, body: &str) {
+        let alerts = self.config().alerts;
+        if alerts.focus {
+            self.host.call_attention(alerts, title, body);
+        }
+    }
+
+    fn dismiss_attention(&self) {
+        if self.approvals.lock().unwrap().is_empty() {
+            self.host.dismiss_attention();
         }
     }
 

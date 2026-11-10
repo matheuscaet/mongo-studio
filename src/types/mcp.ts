@@ -25,6 +25,8 @@ export interface McpConfig {
   connections: Record<string, McpLevel>;
   /** Per connection id, or "*" for capabilities that aren't about one. */
   always: Record<string, McpCapability[]>;
+  /** How the app calls the user back when a request waits. */
+  alerts: { sound: boolean; focus: boolean };
 }
 
 export interface McpClient {

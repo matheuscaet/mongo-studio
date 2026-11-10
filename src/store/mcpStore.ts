@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
+import { playChime, unlockAudioOnFirstGesture } from "../lib/attention";
 import { api } from "../lib/tauri";
 import type {
   McpActivity,
@@ -11,7 +12,7 @@ import type {
   McpRequestChoice,
   McpStatus,
 } from "../types/mcp";
-import { useSettingsStore, type McpSettings } from "./settingsStore";
+import { useSettingsStore, type McpAlerts, type McpSettings } from "./settingsStore";
 import { useConnectionsStore } from "./connectionsStore";
 import { useScriptsStore } from "./scriptsStore";
 import { useSidebarLayoutStore } from "./sidebarLayoutStore";
@@ -62,8 +63,8 @@ export const useMcpStore = create<McpState>((set, get) => ({
   },
 }));
 
-function configOf(mcp: McpSettings): McpConfig {
-  return { enabled: mcp.enabled, port: mcp.port, caps: { ...mcp.caps, browse: "allow" }, connections: mcp.connections, always: mcp.always };
+function configOf(mcp: McpSettings, alerts: McpAlerts): McpConfig {
+  return { enabled: mcp.enabled, port: mcp.port, caps: { ...mcp.caps, browse: "allow" }, connections: mcp.connections, always: mcp.always, alerts };
 }
 
 let started = false;
@@ -78,20 +79,23 @@ export function startMcp() {
   started = true;
   const push = (mcp: McpSettings) =>
     api
-      .mcpSetConfig(configOf(mcp))
+      .mcpSetConfig(configOf(mcp, useSettingsStore.getState().mcpAlerts))
       .then((status) => useMcpStore.setState({ status }))
       .catch((e) =>
         useMcpStore.setState({ status: { running: false, port: mcp.port, url: "", error: String(e), clients: [] } }),
       );
   void push(useSettingsStore.getState().mcp);
   useSettingsStore.subscribe((s, prev) => {
-    if (s.mcp !== prev.mcp) void push(s.mcp);
+    if (s.mcp !== prev.mcp || s.mcpAlerts !== prev.mcpAlerts) void push(s.mcp);
   });
 
   void listen<McpStatus>("mcp-status", ({ payload }) => useMcpStore.setState({ status: payload }));
-  void listen<McpRequest>("mcp-request", ({ payload }) =>
-    useMcpStore.setState((s) => ({ requests: [...s.requests, payload] })),
-  );
+  unlockAudioOnFirstGesture();
+  void listen<McpRequest>("mcp-request", ({ payload }) => {
+    useMcpStore.setState((s) => ({ requests: [...s.requests, payload] }));
+    // the request waits for an answer; the backend brings the window forward
+    if (useSettingsStore.getState().mcpAlerts.sound) void playChime();
+  });
   void listen<{ requestId: string }>("mcp-request-closed", ({ payload }) =>
     useMcpStore.setState((s) => ({ requests: s.requests.filter((r) => r.requestId !== payload.requestId) })),
   );

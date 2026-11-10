@@ -950,6 +950,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
             always: HashMap::new(),
+            alerts: Default::default(),
         }
     }
 
@@ -1275,6 +1276,7 @@ mod live_tests {
                     ("logisticsc".to_string(), Level::Read),
                 ]),
                 always: HashMap::new(),
+                alerts: Default::default(),
             },
         );
         let client = add_session(&inner, "s1", "Live test");
