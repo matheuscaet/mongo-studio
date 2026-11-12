@@ -12,6 +12,11 @@ const ConnectionsImportExportDialog = lazy(() =>
     default: m.ConnectionsImportExportDialog,
   })),
 );
+const DeleteConnectionsDialog = lazy(() =>
+  import("../connections/DeleteConnectionsDialog").then((m) => ({
+    default: m.DeleteConnectionsDialog,
+  })),
+);
 const SettingsDialog = lazy(() =>
   import("../settings/SettingsDialog").then((m) => ({ default: m.SettingsDialog })),
 );
@@ -21,8 +26,8 @@ const EditConnectionDialog = lazy(() =>
 
 /**
  * App-level dialogs, opened from anywhere through uiStore: the connection
- * form (for a new connection or a saved one), import / export and
- * Settings; and the
+ * form (for a new connection or a saved one), import / export, deleting
+ * several connections and Settings; and the
  * questions `confirm()` asks, above them.
  */
 export function DialogHost() {
@@ -30,6 +35,8 @@ export function DialogHost() {
   const setConnectionDialog = useUiStore((s) => s.setConnectionDialog);
   const transfer = useUiStore((s) => s.transfer);
   const closeTransfer = useUiStore((s) => s.closeTransfer);
+  const deleteConnections = useUiStore((s) => s.deleteConnections);
+  const closeDeleteConnections = useUiStore((s) => s.closeDeleteConnections);
   const settingsSection = useUiStore((s) => s.settingsSection);
   const setSettingsSection = useUiStore((s) => s.setSettingsSection);
   const close = () => setConnectionDialog(null);
@@ -40,6 +47,8 @@ export function DialogHost() {
     content = <EditConnectionDialog key={dialog.id} id={dialog.id} onClose={close} />;
   } else if (transfer) {
     content = <ConnectionsImportExportDialog initial={transfer} onClose={closeTransfer} />;
+  } else if (deleteConnections) {
+    content = <DeleteConnectionsDialog initial={deleteConnections} onClose={closeDeleteConnections} />;
   } else if (settingsSection) {
     content = (
       <SettingsDialog

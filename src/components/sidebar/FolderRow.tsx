@@ -1,15 +1,18 @@
 import { useEffect, useRef } from "react";
 import type { PointerEvent } from "react";
 import { Folder, FolderOpen } from "lucide-react";
+import { useConnectionSelection } from "../../store/connectionSelectionStore";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { useSidebarLayoutStore } from "../../store/sidebarLayoutStore";
 import { useUiStore } from "../../store/uiStore";
 import { connectionIds, containsConnections } from "../../lib/sidebarTree";
 import type { FolderNode } from "../../lib/sidebarTree";
 import { RowContextMenu } from "@/components/common/ActionMenu";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { RowMenuButton } from "./RowMenuButton";
+import { groupState } from "../connections/ConnectionTreePicker";
 import { TreeRow } from "./TreeRow";
 import { folderMenuEntries } from "./treeMenus";
 
@@ -35,6 +38,8 @@ export function FolderRow({ folder, depth, expanded, dragClass, onPress }: Folde
   const { toggleFolder, startRename, renameFolder, deleteFolder, createFolder } =
     useSidebarLayoutStore.getState();
   const inputRef = useRef<HTMLInputElement>(null);
+  const selecting = useConnectionSelection((s) => s.selecting);
+  const pickedIds = useConnectionSelection((s) => s.ids);
 
   useEffect(() => {
     if (renaming) inputRef.current?.select();
@@ -51,12 +56,16 @@ export function FolderRow({ folder, depth, expanded, dragClass, onPress }: Folde
       onRename: () => startRename(folder.id),
       onDisconnectAll: () => void disconnectAll(connected),
       onExport: () => useUiStore.getState().openTransfer("export", connectionIds(folder.children)),
+      onDeleteConnections: () =>
+        useUiStore.getState().openDeleteConnections(connectionIds(folder.children)),
       onDelete: () => deleteFolder(folder.id),
     });
   };
 
   const Icon = expanded ? FolderOpen : Folder;
   const count = countConnections(folder);
+  const ids = selecting ? connectionIds(folder.children) : [];
+  const folderState = groupState(ids, (id) => pickedIds.includes(id));
 
   return (
     <RowContextMenu entries={entries}>
@@ -67,7 +76,21 @@ export function FolderRow({ folder, depth, expanded, dragClass, onPress }: Folde
         depth={depth}
         expanded={expanded}
         className={cn(dragClass)}
-        icon={<Icon className="size-3.5 shrink-0 text-fg-2" aria-hidden />}
+        icon={
+          <>
+            {selecting && ids.length > 0 && (
+              // ticks everything in the folder; the rest of the row still opens it
+              <Checkbox
+                data-no-drag=""
+                checked={folderState}
+                aria-label={`All in ${folder.name}`}
+                onClick={(e) => e.stopPropagation()}
+                onCheckedChange={() => useConnectionSelection.getState().setMany(ids, folderState !== true)}
+              />
+            )}
+            <Icon className="size-3.5 shrink-0 text-fg-2" aria-hidden />
+          </>
+        }
         labelClassName={renaming ? "flex-1" : undefined}
         label={
           renaming ? (

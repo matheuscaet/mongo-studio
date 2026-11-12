@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftRight, FolderPlus, Plus } from "lucide-react";
+import { ArrowLeftRight, FolderPlus, ListChecks, Plus, Trash2, X } from "lucide-react";
+import { deleteConnections, useConnectionSelection } from "../../store/connectionSelectionStore";
 import { sessionIdFor, useConnectionsStore } from "../../store/connectionsStore";
 import { useSidebarLayoutStore } from "../../store/sidebarLayoutStore";
 import { useSessionsStore } from "../../store/sessionsStore";
 import { useUiStore } from "../../store/uiStore";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { cn } from "@/lib/utils";
+import { groupState } from "../connections/ConnectionTreePicker";
 import { ConnectionTree } from "./ConnectionTree";
 import { ExplorerSearch } from "./ExplorerSearch";
 import { PanelHeader } from "./PanelHeader";
@@ -25,6 +29,13 @@ export function Sidebar() {
   const createFolder = useSidebarLayoutStore((s) => s.createFolder);
   const [search, setSearch] = useState("");
   const collectionMatches = useCollectionMatches(search.trim().toLowerCase());
+  const selectedIds = useConnectionSelection((s) => s.ids);
+  const selecting = useConnectionSelection((s) => s.selecting);
+  const setSelecting = useConnectionSelection((s) => s.setSelecting);
+  const allIds = profiles.map((p) => p.id);
+  const allState = groupState(allIds, (id) => selectedIds.includes(id));
+  // only the picks still saved: one deleted elsewhere drops out
+  const picked = selectedIds.filter((id) => profiles.some((p) => p.id === id));
 
   // Enter opens the first collection found, so a few letters and Enter get
   // you to a collection without the mouse.
@@ -63,6 +74,18 @@ export function Sidebar() {
   return (
     <div className="flex h-full min-h-0 flex-col bg-panel">
       <PanelHeader title="Explorer">
+        <Button
+          variant="ghost"
+          size="icon"
+          title={selecting ? "Stop selecting (Esc)" : "Select connections"}
+          aria-label="Select connections"
+          aria-pressed={selecting}
+          disabled={profiles.length === 0}
+          className={cn(selecting && "bg-sel text-fg")}
+          onClick={() => setSelecting(!selecting)}
+        >
+          <ListChecks />
+        </Button>
         <Button
           variant="ghost"
           size="icon"
@@ -110,6 +133,44 @@ export function Sidebar() {
           <ConnectionTree search={search} />
         )}
       </div>
+
+      {(selecting || picked.length > 0) && (
+        <div
+          role="toolbar"
+          aria-label="Selected connections"
+          className="flex h-9 shrink-0 items-center gap-1.5 border-t border-line px-2 text-sm text-fg-2"
+        >
+          {selecting && (
+            <Checkbox
+              checked={allState}
+              aria-label="Select all connections"
+              title="Select all"
+              onCheckedChange={() => useConnectionSelection.getState().setMany(allIds, allState !== true)}
+            />
+          )}
+          <span className="min-w-0 flex-1 truncate tabular-nums">
+            {picked.length === 1 ? "1 connection" : `${picked.length} connections`} selected
+          </span>
+          <Button
+            size="sm"
+            variant="destructive"
+            disabled={picked.length === 0}
+            onClick={() => void deleteConnections(picked)}
+          >
+            <Trash2 />
+            Delete
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title={selecting ? "Done (Esc)" : "Clear selection (Esc)"}
+            aria-label={selecting ? "Done selecting" : "Clear selection"}
+            onClick={() => setSelecting(false)}
+          >
+            <X />
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

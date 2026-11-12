@@ -1,4 +1,6 @@
 import { useCallback, useMemo } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
+import { deleteConnections, useConnectionSelection } from "../../store/connectionSelectionStore";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { useSidebarLayoutStore } from "../../store/sidebarLayoutStore";
 import { filterTree } from "../../lib/sidebarTree";
@@ -23,6 +25,17 @@ function indicatorClass(drag: DragState | null, nodeId: string): string {
   if (ind.position === "before") return LINE_ABOVE;
   if (ind.position === "after") return LINE_BELOW;
   return "bg-accent/20 outline outline-1 -outline-offset-1 outline-accent hover:bg-accent/20";
+}
+
+/** The connections a row's shown for, top to bottom: what a Shift-click ranges over. */
+function visibleConnections(nodes: TreeNode[], searching: boolean): string[] {
+  return nodes.flatMap((n) =>
+    n.type === "connection"
+      ? [n.id]
+      : searching || !n.collapsed
+        ? visibleConnections(n.children, searching)
+        : [],
+  );
 }
 
 interface ConnectionTreeProps {
@@ -52,6 +65,36 @@ export function ConnectionTree({ search }: ConnectionTreeProps) {
           (byId.get(id)?.name.toLowerCase().includes(query) ?? false),
       )
     : root;
+  const selectedIds = useConnectionSelection((s) => s.ids);
+  const selected = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  // Cmd/Ctrl-click picks a connection and Shift-click a run of them, without
+  // connecting; a plain click clears the picks and works the row as ever.
+  function handleRowClick(e: MouseEvent, id: string) {
+    const selection = useConnectionSelection.getState();
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      selection.toggle(id);
+    } else if (e.shiftKey) {
+      e.preventDefault();
+      selection.selectRange(id, visibleConnections(shown, searching));
+    } else if (selection.ids.length > 0 && !selection.selecting) {
+      selection.clear();
+    }
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    // keys typed in a field inside the tree (a folder's name) are its own
+    if (e.target instanceof HTMLInputElement) return;
+    const { ids, selecting, setSelecting } = useConnectionSelection.getState();
+    if (e.key === "Escape" && (ids.length > 0 || selecting)) {
+      e.preventDefault();
+      setSelecting(false);
+    } else if (ids.length > 0 && (e.key === "Delete" || e.key === "Backspace")) {
+      e.preventDefault();
+      void deleteConnections(ids);
+    }
+  }
 
   function renderNodes(nodes: TreeNode[], depth: number) {
     return nodes.map((node) => {
@@ -80,11 +123,13 @@ export function ConnectionTree({ search }: ConnectionTreeProps) {
           depth={depth}
           query={query}
           collectionMatches={collectionMatches}
+          selected={selected.has(node.id)}
           rowProps={{
             "data-node-id": node.id,
             "data-node-type": "connection",
             className: indicatorClass(drag, node.id),
             onPointerDown: (e) => startPress(e, node.id, profile.name),
+            onClick: (e) => handleRowClick(e, node.id),
           }}
         />
       );
@@ -98,7 +143,9 @@ export function ConnectionTree({ search }: ConnectionTreeProps) {
       data-tree-root=""
       role="tree"
       aria-label="Connections"
+      aria-multiselectable
       className="flex min-h-full flex-col pb-3 pt-0.5"
+      onKeyDown={handleKeyDown}
     >
       {searching && shown.length === 0 && (
         <p className="px-3 py-2.5 text-sm text-fg-3">
