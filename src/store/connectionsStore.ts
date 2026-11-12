@@ -36,6 +36,11 @@ interface ConnectionsState {
   loadSecretBackendInfo: () => Promise<void>;
   saveProfile: (input: ConnectionProfileInput) => Promise<void>;
   deleteProfile: (id: string) => Promise<void>;
+  /**
+   * Deletes these connections, disconnecting the connected ones first.
+   * Resolves to the ids that couldn't be deleted (empty when all were).
+   */
+  deleteProfiles: (ids: string[]) => Promise<string[]>;
   /** Sets how a connection's legacy UUIDs show; null leaves it to the connection string. */
   setLegacyUuid: (id: string, encoding: LegacyUuidEncoding | null) => Promise<void>;
   testConnection: (input: ConnectionProfileInput) => Promise<void>;
@@ -100,15 +105,27 @@ export const useConnectionsStore = create<ConnectionsState>((set, get) => ({
   },
 
   deleteProfile: async (id) => {
-    // Deleting the connection in use would leave a session nothing points to.
-    if (get().sessions[id]) await get().disconnect(id);
+    await get().deleteProfiles([id]);
+  },
+
+  deleteProfiles: async (ids) => {
+    // Deleting a connection in use would leave a session nothing points to.
+    await get().disconnectAll(ids);
     set({ loading: true, error: null });
-    try {
-      await api.deleteConnectionProfile(id);
-      await get().refreshProfiles();
-    } catch (e) {
-      set({ error: String(e), loading: false });
+    const failed: string[] = [];
+    const errors: string[] = [];
+    // One at a time: each delete rewrites the saved connections file.
+    for (const id of ids) {
+      try {
+        await api.deleteConnectionProfile(id);
+      } catch (e) {
+        failed.push(id);
+        errors.push(String(e));
+      }
     }
+    await get().refreshProfiles();
+    if (errors.length > 0) set({ error: errors.join("\n") });
+    return failed;
   },
 
   setLegacyUuid: async (id, encoding) => {

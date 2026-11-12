@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import type { HTMLAttributes } from "react";
 import { confirm } from "../../store/confirmStore";
+import { deleteConnections, useConnectionSelection } from "../../store/connectionSelectionStore";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { databaseKey } from "../../store/sessionsStore";
 import { useUiStore } from "../../store/uiStore";
 import type { ConnectionProfileMeta } from "../../types/connection";
 import { RowContextMenu } from "@/components/common/ActionMenu";
+import { Checkbox } from "@/components/ui/checkbox";
 import { ConnectionChip } from "@/components/ui/ConnectionChip";
 import { connectionColor } from "@/lib/connectionColor";
 import { ConnectionStatus } from "./ConnectionStatus";
@@ -13,7 +15,7 @@ import { DatabaseRow } from "./DatabaseRow";
 import { Highlighted } from "./Highlighted";
 import { RowMenuButton } from "./RowMenuButton";
 import { TreeRow } from "./TreeRow";
-import { connectionMenuEntries } from "./treeMenus";
+import { connectionMenuEntries, selectionMenuEntries } from "./treeMenus";
 import type { CollectionMatches } from "./useCollectionMatches";
 
 interface ConnectionRowProps {
@@ -26,6 +28,8 @@ interface ConnectionRowProps {
   query?: string;
   /** Collections matching the sidebar search, on any connection. */
   collectionMatches?: CollectionMatches | null;
+  /** Picked in the Explorer's multi-selection. */
+  selected?: boolean;
 }
 
 export function ConnectionRow({
@@ -34,6 +38,7 @@ export function ConnectionRow({
   rowProps,
   query = "",
   collectionMatches = null,
+  selected = false,
 }: ConnectionRowProps) {
   const session = useConnectionsStore((s) => s.sessions[profile.id]);
   const connecting = useConnectionsStore((s) => s.connecting[profile.id] ?? false);
@@ -41,6 +46,7 @@ export function ConnectionRow({
   const connect = useConnectionsStore((s) => s.connect);
   const disconnect = useConnectionsStore((s) => s.disconnect);
   const deleteProfile = useConnectionsStore((s) => s.deleteProfile);
+  const selecting = useConnectionSelection((s) => s.selecting);
   const [expanded, setExpanded] = useState(false);
 
   const isActive = session !== undefined;
@@ -62,15 +68,30 @@ export function ConnectionRow({
   }
 
   function handleToggle() {
-    if (isActive) {
+    // in select mode a click (or Enter / Space) picks the row instead
+    if (selecting) {
+      useConnectionSelection.getState().toggle(profile.id);
+    } else if (isActive) {
       setExpanded((e) => !e);
     } else {
       connect(profile.id);
     }
   }
 
-  const entries = () =>
-    connectionMenuEntries({
+  const entries = () => {
+    // on a row among several picked, the menu works on all of them
+    const picked = useConnectionSelection.getState().ids;
+    if (picked.length > 1 && picked.includes(profile.id)) {
+      const { sessions, disconnectAll } = useConnectionsStore.getState();
+      return selectionMenuEntries({
+        count: picked.length,
+        connectedCount: picked.filter((id) => sessions[id]).length,
+        onDisconnect: () => void disconnectAll(picked),
+        onExport: () => useUiStore.getState().openTransfer("export", picked),
+        onDelete: () => void deleteConnections(picked),
+      });
+    }
+    return connectionMenuEntries({
       connected: isActive,
       onConnect: () => connect(profile.id),
       onDisconnect: () => disconnect(profile.id),
@@ -78,16 +99,24 @@ export function ConnectionRow({
       onExport: () => useUiStore.getState().openTransfer("export", [profile.id]),
       onDelete: handleDelete,
     });
+  };
 
   return (
     <>
       <RowContextMenu entries={entries}>
         <TreeRow
           {...rowProps}
+          selected={selected}
           depth={depth}
           expanded={isActive ? showChildren : undefined}
           icon={
-            <ConnectionChip name={profile.name} color={connectionColor(profile.id, profile.color)} />
+            <>
+              {selecting && (
+                // the row takes the click; the box only shows the state
+                <Checkbox checked={selected} tabIndex={-1} aria-hidden className="pointer-events-none" />
+              )}
+              <ConnectionChip name={profile.name} color={connectionColor(profile.id, profile.color)} />
+            </>
           }
           labelClassName="font-medium"
           label={<Highlighted name={profile.name} query={query} />}

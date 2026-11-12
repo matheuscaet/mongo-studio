@@ -18,6 +18,7 @@ interface FolderMenu {
   onRename: () => void;
   onDisconnectAll: () => void;
   onExport: () => void;
+  onDeleteConnections: () => void;
   onDelete: () => void;
 }
 
@@ -37,6 +38,9 @@ export function folderMenuEntries(m: FolderMenu): MenuEntry[] {
         ]
       : []),
     { separator: true },
+    ...(m.hasConnections
+      ? [{ label: "Delete connections in folder...", icon: Trash2, danger: true, onSelect: m.onDeleteConnections }]
+      : []),
     {
       label: m.hasConnections ? "Delete folder (move its connections out first)" : "Delete folder",
       icon: Trash2,
@@ -65,6 +69,29 @@ export function connectionMenuEntries(m: ConnectionMenu): MenuEntry[] {
     { label: "Export connection...", icon: Download, onSelect: m.onExport },
     { separator: true },
     { label: "Delete connection...", icon: Trash2, danger: true, onSelect: m.onDelete },
+  ];
+}
+
+interface SelectionMenu {
+  /** How many connections are picked. */
+  count: number;
+  /** How many of them are connected. */
+  connectedCount: number;
+  onDisconnect: () => void;
+  onExport: () => void;
+  onDelete: () => void;
+}
+
+/** The menu on a row among several picked connections: it works on all of them. */
+export function selectionMenuEntries(m: SelectionMenu): MenuEntry[] {
+  return [
+    { heading: `${m.count} connections` },
+    ...(m.connectedCount > 0
+      ? [{ label: `Disconnect ${m.connectedCount === 1 ? "1 connection" : `${m.connectedCount} connections`}`, icon: Unplug, onSelect: m.onDisconnect }]
+      : []),
+    { label: `Export ${m.count} connections...`, icon: Download, onSelect: m.onExport },
+    { separator: true },
+    { label: `Delete ${m.count} connections...`, icon: Trash2, shortcut: "Del", danger: true, onSelect: m.onDelete },
   ];
 }
 

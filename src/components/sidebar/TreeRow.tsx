@@ -17,7 +17,10 @@ interface TreeRowProps extends Omit<ComponentProps<"div">, "children"> {
   /** Status, counts and actions, pushed to the right edge. */
   trailing?: ReactNode;
   selected?: boolean;
-  /** Runs on click, and on Enter or Space while the row has focus. */
+  /**
+   * Runs on click, and on Enter or Space while the row has focus. An
+   * `onClick` that calls `preventDefault` keeps the click from it.
+   */
   onActivate?: () => void;
 }
 
@@ -39,7 +42,7 @@ export function TreeRow({
 }: TreeRowProps) {
   function handleClick(e: MouseEvent<HTMLDivElement>) {
     onClick?.(e);
-    onActivate?.();
+    if (!e.defaultPrevented) onActivate?.();
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLDivElement>) {

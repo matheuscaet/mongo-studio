@@ -12,6 +12,7 @@ import {
   Sparkles,
   SquareTerminal,
   Sun,
+  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAssistantStore } from "../../store/assistantStore";
@@ -117,6 +118,12 @@ export function PaletteActions({ search, run }: PaletteActionsProps) {
       icon: <ArrowLeftRight />,
       label: "Import / export connections",
       perform: () => useUiStore.getState().openTransfer("export"),
+    },
+    {
+      id: "delete-connections",
+      icon: <Trash2 />,
+      label: "Delete connections",
+      perform: () => useUiStore.getState().openDeleteConnections(),
     },
     {
       id: "new-relation",

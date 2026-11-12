@@ -61,6 +61,11 @@ interface UiState {
   /** Opens it on `tab`; an export starts with `ids` ticked (all when null). */
   openTransfer: (tab: TransferDialog["tab"], ids?: string[] | null) => void;
   closeTransfer: () => void;
+  /** The delete connections dialog: the connections it starts with ticked. */
+  deleteConnections: string[] | null;
+  /** Opens it with `ids` ticked (none when omitted). */
+  openDeleteConnections: (ids?: string[]) => void;
+  closeDeleteConnections: () => void;
   /** The Settings dialog's section, or null when it's closed. */
   settingsSection: SettingsSection | null;
   setSettingsSection: (section: SettingsSection | null) => void;
@@ -107,6 +112,9 @@ export const useUiStore = create<UiState>()(
       transfer: null,
       openTransfer: (tab, ids = null) => set({ transfer: { tab, ids }, settingsSection: null }),
       closeTransfer: () => set({ transfer: null }),
+      deleteConnections: null,
+      openDeleteConnections: (ids = []) => set({ deleteConnections: ids, settingsSection: null }),
+      closeDeleteConnections: () => set({ deleteConnections: null }),
       settingsSection: null,
       setSettingsSection: (section) => set({ settingsSection: section }),
       paletteOpen: false,
