@@ -13,6 +13,9 @@ export type AuthMechanism =
   | "MONGODB_AWS"
   | "GSSAPI";
 
+/** `null` connects with the driver's own default (primary). */
+export type ReadPreference = "PRIMARY" | "SECONDARY";
+
 export interface TlsOptions {
   enabled: boolean;
   caFile: string | null;
@@ -41,7 +44,7 @@ export interface ConnectionAdvancedOptions {
   maxPoolSize: number | null;
   minPoolSize: number | null;
   replicaSet: string | null;
-  readPreference: string | null;
+  readPreference: ReadPreference | null;
   retryWrites: boolean | null;
   directConnection: boolean | null;
   authMechanism: AuthMechanism | null;

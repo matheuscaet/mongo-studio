@@ -7,6 +7,7 @@ import {
   type AuthMechanism,
   type ConnectionAdvancedOptions,
   type LegacyUuidEncoding,
+  type ReadPreference,
 } from "@/types/connection";
 import { DATA_FIELD, numberOrNull, type ConnectionSectionProps } from "./connectionFormTypes";
 import { Field } from "./Field";
@@ -99,16 +100,32 @@ export function AdvancedSection({ input, update }: ConnectionSectionProps) {
       </FieldRow>
       <FieldRow>
         {text("replicaSet", "adv-replica-set", "Replica set", "Optional")}
+        <Field label="Read preference" htmlFor="adv-read-preference">
+          <Select
+            value={advanced.readPreference ?? "PRIMARY"}
+            onValueChange={(v) =>
+              set({ readPreference: v === "PRIMARY" ? null : (v as ReadPreference) })
+            }
+          >
+            <SelectTrigger id="adv-read-preference" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="PRIMARY">Primary</SelectItem>
+              <SelectItem value="SECONDARY">Secondary</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+      </FieldRow>
+      <FieldRow>
         {number("maxPoolSize", "adv-max-pool", "Max pool size", "4")}
+        {number("minPoolSize", "adv-min-pool", "Min pool size", "1")}
       </FieldRow>
       <FieldRow>
         {number("serverSelectionTimeoutMs", "adv-sst", "Server selection timeout (ms)", "Driver default")}
         {number("connectTimeoutMs", "adv-cto", "Connect timeout (ms)", "Driver default")}
       </FieldRow>
-      <FieldRow>
-        {text("appName", "adv-app-name", "App name", "mongo-studio")}
-        {number("minPoolSize", "adv-min-pool", "Min pool size", "1")}
-      </FieldRow>
+      {text("appName", "adv-app-name", "App name", "mongo-studio")}
       <Field
         label="Legacy UUIDs (binary subtype 3)"
         htmlFor="adv-legacy-uuid"
