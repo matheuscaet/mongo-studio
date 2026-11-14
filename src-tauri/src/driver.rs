@@ -3,7 +3,8 @@ use std::sync::Arc;
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Document};
 use mongodb::options::{
-    ClientOptions, Credential, ReturnDocument, ServerAddress, Tls, TlsOptions as DriverTlsOptions,
+    ClientOptions, Credential, ReturnDocument, SelectionCriteria, ServerAddress, Tls,
+    TlsOptions as DriverTlsOptions,
 };
 use mongodb::Client;
 
@@ -106,6 +107,11 @@ fn apply_advanced_overrides(
     if let Some(rs) = &advanced.replica_set {
         options.repl_set_name = Some(rs.clone());
     }
+    if let Some(read_preference) = advanced.read_preference {
+        options.selection_criteria = Some(SelectionCriteria::ReadPreference(map_read_preference(
+            read_preference,
+        )));
+    }
     if let Some(retry) = advanced.retry_writes {
         options.retry_writes = Some(retry);
     }
@@ -156,6 +162,14 @@ fn map_auth_mechanism(
              Kerberos/SASL dependency. See README for details."
                 .to_string(),
         )),
+    }
+}
+
+fn map_read_preference(preference: models::ReadPreference) -> mongodb::options::ReadPreference {
+    use mongodb::options::ReadPreference as Driver;
+    match preference {
+        models::ReadPreference::Primary => Driver::Primary,
+        models::ReadPreference::Secondary => Driver::Secondary { options: None },
     }
 }
 
@@ -898,7 +912,7 @@ pub async fn explain_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AuthMechanism, ConnectionAdvancedOptions, TlsOptions};
+    use crate::models::{AuthMechanism, ConnectionAdvancedOptions, ReadPreference, TlsOptions};
     use crate::secrets::InMemoryStore;
 
     fn segments(parts: &[&str]) -> Vec<String> {
@@ -971,6 +985,29 @@ mod tests {
         let credential = options.credential.unwrap();
         assert_eq!(credential.username.as_deref(), Some("alice"));
         assert_eq!(credential.password.as_deref(), Some("p@ss"));
+    }
+
+    #[tokio::test]
+    async fn no_read_preference_leaves_the_driver_default_of_primary() {
+        let options = options_for(&profile(None, false), &InMemoryStore::new())
+            .await
+            .unwrap();
+        assert!(options.selection_criteria.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_secondary_read_preference_is_applied_to_the_client() {
+        let mut secondary = profile(None, false);
+        secondary.advanced.read_preference = Some(ReadPreference::Secondary);
+        let options = options_for(&secondary, &InMemoryStore::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            options.selection_criteria,
+            Some(SelectionCriteria::ReadPreference(
+                mongodb::options::ReadPreference::Secondary { .. }
+            ))
+        ));
     }
 
     #[test]
