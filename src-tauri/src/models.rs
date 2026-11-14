@@ -92,6 +92,13 @@ impl LegacyUuidEncoding {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReadPreference {
+    Primary,
+    Secondary,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionAdvancedOptions {
@@ -101,7 +108,8 @@ pub struct ConnectionAdvancedOptions {
     pub max_pool_size: Option<u32>,
     pub min_pool_size: Option<u32>,
     pub replica_set: Option<String>,
-    pub read_preference: Option<String>,
+    /// `None` connects with the driver's own default (primary).
+    pub read_preference: Option<ReadPreference>,
     pub retry_writes: Option<bool>,
     pub direct_connection: Option<bool>,
     pub auth_mechanism: Option<AuthMechanism>,
