@@ -9,7 +9,8 @@
 //! the result; then the call runs on the server's own Mongo client for that
 //! connection. Every call is reported to the windows as an `mcp-activity`
 //! event. Logs name the tool, connection and namespace, never filters,
-//! documents or scripts.
+//! documents or scripts; those go only into the history the user keeps on
+//! this computer (`history`), when they keep one.
 
 mod documents;
 mod many;
@@ -25,6 +26,7 @@ use mongodb::{Client, IndexModel};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use super::history::{self, HistoryEntry, HistoryFilter};
 use super::policy::{self, Answer, Cap, Decision, Request};
 use super::tasks::{self, Phase, Task};
 use super::{
@@ -60,6 +62,8 @@ const MAX_INSERT: usize = 1000;
 const DEFAULT_SCRIPT_MS: i64 = 30_000;
 const MAX_SCRIPT_MS: i64 = 300_000;
 const DEFAULT_TASK_WAIT_MS: i64 = 30_000;
+const DEFAULT_HISTORY: i64 = 20;
+const MAX_HISTORY: i64 = 200;
 const SCRIPT_READ_ONLY_HINT: &str = "You have read-only access to this connection in Mongo \
 Studio, and this script could write. Run it with read_only: true (writes are refused and stop \
 the script) or dry_run: true (writes are only counted).";
@@ -101,6 +105,7 @@ pub(crate) enum Tool {
     DeleteRelation,
     GetTask,
     CancelTask,
+    GetHistory,
 }
 
 /// What a tool works on, and so which of connection_id, database and
@@ -114,7 +119,7 @@ enum Scope {
 }
 
 impl Tool {
-    const ALL: [Tool; 33] = [
+    const ALL: [Tool; 34] = [
         Tool::ListConnections,
         Tool::ListDatabases,
         Tool::ListCollections,
@@ -148,6 +153,7 @@ impl Tool {
         Tool::DeleteRelation,
         Tool::GetTask,
         Tool::CancelTask,
+        Tool::GetHistory,
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -189,6 +195,7 @@ impl Tool {
             Tool::DeleteRelation => "delete_relation",
             Tool::GetTask => "get_task",
             Tool::CancelTask => "cancel_task",
+            Tool::GetHistory => "get_history",
         }
     }
 
@@ -199,6 +206,8 @@ impl Tool {
         match self {
             // About calls the client already made, each checked then.
             Tool::GetTask | Tool::CancelTask => Cap::Browse,
+            // It shows what ran on the connections, scripts and filters included.
+            Tool::GetHistory => Cap::Read,
             Tool::ListConnections => Cap::ConnList,
             Tool::ListDatabases
             | Tool::ListCollections
@@ -239,6 +248,7 @@ impl Tool {
             | Tool::DeleteRelation
             | Tool::GetTask
             | Tool::CancelTask
+            | Tool::GetHistory
             // its connections are checked one by one, in `many`
             | Tool::RunScriptOnConnections => Scope::Nothing,
             // The From (or source) connection; the other side's is resolved
@@ -269,6 +279,7 @@ impl Tool {
                 | Tool::DeleteRelation
                 | Tool::GetTask
                 | Tool::CancelTask
+                | Tool::GetHistory
                 | Tool::RunScriptOnConnections
         )
     }
@@ -613,6 +624,20 @@ fn all_definitions() -> Vec<Value> {
         "inputSchema": { "type": "object", "properties": { "task_id": task_id }, "required": ["task_id"] },
         "annotations": writes,
     }));
+    defs.push(json!({
+        "name": "get_history",
+        "description": "What MCP clients changed through Mongo Studio, newest first, as kept on this computer when the user keeps a history: every write, schema change, connection edit and script that ran, with its code, time, connection and environment, who approved it, and what it changed or why it failed. Markdown is ready to paste into a ticket or pull request. Only connections you may read are shown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connection_id": { "type": "string", "description": "Only this connection's entries." },
+                "since": { "type": "string", "description": "Only entries from then on: a date (2026-11-16) or an ISO date-time." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_HISTORY, "default": DEFAULT_HISTORY },
+                "format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" },
+            },
+        },
+        "annotations": read_only,
+    }));
     defs
 }
 
@@ -631,6 +656,11 @@ struct Target {
     collection: Option<String>,
     /// Shown instead of the namespace, e.g. a relation's name.
     label: Option<String>,
+    /// A call on several connections: their names and ids, and their
+    /// environments, for the history.
+    names: Option<String>,
+    ids: Vec<String>,
+    environments: Option<String>,
 }
 
 impl Target {
@@ -702,11 +732,14 @@ struct Call<'a> {
     task: Arc<Task>,
     /// A read that lost its connection and ran again.
     retried: bool,
+    /// What runs, as the approval card shows it, for the history.
+    code: Option<String>,
 }
 
 impl Call<'_> {
     /// Reports the call to the windows and the log, and builds the output.
     fn finish(&self, result: &str, label: String, meta: String, text: String) -> ToolOutput {
+        self.record(result, &label, &meta, &text);
         self.inner.emit(
             ACTIVITY_EVENT,
             &ActivityEvent {
@@ -723,6 +756,44 @@ impl Call<'_> {
         ToolOutput {
             text: truncate(text, MAX_OUTPUT),
             is_error: result != "ok",
+        }
+    }
+
+    /// Keeps a call that ran and could change something - and every
+    /// script - in the history, when the user keeps one.
+    fn record(&self, result: &str, label: &str, meta: &str, text: &str) {
+        let script = matches!(self.tool, Tool::RunScript | Tool::RunScriptOnConnections);
+        if self.task.phase() != Phase::Running || !(self.task.changes_data || script) {
+            return;
+        }
+        if !self.inner.config().history {
+            return;
+        }
+        let profile = self.target.profile.as_ref();
+        let failed = result != "ok";
+        let entry = HistoryEntry {
+            at: now_ms(),
+            client: self.client.name.clone(),
+            tool: self.tool.name().to_string(),
+            connection_id: self.target.connection_id.clone(),
+            connection_ids: self.target.ids.clone(),
+            connection_name: profile
+                .map(|p| p.name.clone())
+                .or_else(|| self.target.names.clone()),
+            environment: profile
+                .and_then(|p| p.environment)
+                .map(|e| e.id().to_string())
+                .or_else(|| self.target.environments.clone()),
+            target: self.target.text(),
+            code: self.code.clone().unwrap_or_default(),
+            outcome: if failed { "error" } else { "ok" }.to_string(),
+            summary: meta.to_string(),
+            error: failed.then(|| logging::scrub_credentials(text)),
+            approval: label.split(" · ").next().unwrap_or(label).to_string(),
+            duration_ms: self.started.elapsed().as_millis() as u64,
+        };
+        if let Err(e) = self.inner.history.append(entry) {
+            log::warn!("MCP server: couldn't add to the history: {e}");
         }
     }
 
@@ -828,6 +899,7 @@ pub(crate) async fn call(
             started: Instant::now(),
             task: followed,
             retried: false,
+            code: None,
         };
         run_call(&mut call, &args).await
     };
@@ -959,6 +1031,7 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         Ok(plan) => plan,
         Err(e) => return call.fail(e),
     };
+    call.code = Some(plan.code.clone());
 
     let label = match decision {
         Decision::Allow => "Allowed",
@@ -1723,6 +1796,10 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
                 ),
             )
         }
+        Tool::GetHistory => plan(
+            "Read the history of changes".to_string(),
+            "get_history".to_string(),
+        ),
         Tool::SaveScript => {
             let (name, content) = script_save_args(args)?;
             plan(format!("Save the script \"{name}\""), content)
@@ -1799,6 +1876,7 @@ async fn execute(
         Tool::UpdateConnection => update_connection(call, args).await,
         Tool::DeleteConnection => delete_connection(call).await,
         Tool::SaveScript => save_script(call, args),
+        Tool::GetHistory => get_history(call, args),
         tool if tool.is_relation_tool() => relations::execute(call, args, mongo).await,
         _ => {
             let client = mongo.expect("data tools have a client");
@@ -2267,6 +2345,56 @@ fn explain<'a>(
             meta: summary.meta,
         })
     })
+}
+
+/// get_history: the history, as far as the client may read it.
+fn get_history(call: &Call<'_>, args: &Value) -> AppResult<Done> {
+    let config = call.inner.config();
+    let since = match str_arg(args, "since") {
+        None => None,
+        Some(text) => Some(parse_since(&text)?),
+    };
+    let limit = int_arg(args, "limit", DEFAULT_HISTORY, MAX_HISTORY) as usize;
+    let readable = |id: &String| policy::level_of(&config, id) >= Level::Read;
+    let entries: Vec<HistoryEntry> = call
+        .inner
+        .history
+        .list(&HistoryFilter {
+            connection_id: str_arg(args, "connection_id"),
+            since,
+            limit: None,
+        })?
+        .into_iter()
+        .filter(|e| {
+            e.connection_id.as_ref().is_none_or(readable) && e.connection_ids.iter().all(readable)
+        })
+        .take(limit)
+        .collect();
+    let n = plural(entries.len() as u64, "entry", "entries");
+    let mut text = match str_arg(args, "format").as_deref() {
+        Some("json") => history::json(&entries),
+        _ => history::markdown(&entries),
+    };
+    if !config.history {
+        text.insert_str(
+            0,
+            "(The user has turned the history off in Mongo Studio: new calls aren't kept.)\n\n",
+        );
+    }
+    Ok(Done { text, meta: n })
+}
+
+/// A date (`2026-11-16`, from midnight UTC) or an RFC 3339 date-time.
+fn parse_since(text: &str) -> AppResult<u64> {
+    let text = text.trim();
+    let full = if text.len() == 10 {
+        format!("{text}T00:00:00Z")
+    } else {
+        text.to_string()
+    };
+    mongodb::bson::DateTime::parse_rfc3339_str(&full)
+        .map(|d| d.timestamp_millis().max(0) as u64)
+        .map_err(|_| invalid("since must be a date like 2026-11-16 or an ISO date-time."))
 }
 
 // --- Saved connections ---
@@ -2814,6 +2942,7 @@ mod tests {
             always: HashMap::new(),
             alerts: Default::default(),
             confirm_production: true,
+            history: true,
         }
     }
 
@@ -3486,6 +3615,7 @@ mod live_tests {
                 always: HashMap::new(),
                 alerts: Default::default(),
                 confirm_production: true,
+                history: true,
             },
         );
         (host, inner)
@@ -4025,6 +4155,95 @@ mod live_tests {
         let out = run(&inner, "run_script_on_connections", read).await;
         assert!(!out.is_error, "{}", out.text);
         assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        inner.pool.close_all("test over").await;
+    }
+
+    /// Writes and scripts that ran are kept with their code; reads and
+    /// refusals aren't; get_history hands them back as Markdown.
+    #[tokio::test]
+    #[ignore]
+    async fn live_history_keeps_what_ran() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        run(
+            &inner,
+            "insert_documents",
+            on(&coll, json!({ "documents": [{ "a": 1 }] })),
+        )
+        .await;
+        run(&inner, "find", on(&coll, json!({}))).await;
+        run(
+            &inner,
+            "run_script",
+            json!({ "connection_id": "live", "database": TEST_DB, "read_only": true,
+            "script": format!("await db.{coll}.countDocuments({{}})") }),
+        )
+        .await;
+        run(
+            &inner,
+            "update_documents",
+            on(
+                &coll,
+                json!({ "filter": { "a": 1 }, "update": { "$set": { "b": 2 } } }),
+            ),
+        )
+        .await;
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .caps
+            .insert("write".into(), Policy::Off);
+        run(
+            &inner,
+            "delete_documents",
+            on(&coll, json!({ "filter": {} })),
+        )
+        .await;
+
+        let entries = inner.history.list(&HistoryFilter::default()).unwrap();
+        let tools: Vec<&str> = entries.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(
+            tools,
+            ["update_documents", "run_script", "insert_documents"]
+        );
+        assert!(
+            entries[0].code.contains("updateOne({\"a\":1}"),
+            "{:?}",
+            entries[0]
+        );
+        assert_eq!(entries[0].summary, "1 document modified");
+        assert_eq!(entries[0].connection_name.as_deref(), Some("Live"));
+
+        let out = run(
+            &inner,
+            "get_history",
+            json!({ "limit": 2, "since": "2020-01-01" }),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("# Changes made through Mongo Studio's MCP server\n\n2 calls"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("run_script"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::None);
+        let out = run(&inner, "get_history", json!({})).await;
+        assert!(out.text.contains("Nothing recorded"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::Write);
+        run(&inner, "drop_collection", on(&coll, json!({}))).await;
         inner.pool.close_all("test over").await;
     }
 

@@ -24,6 +24,8 @@ export interface McpSettings {
   always: Record<string, McpCapability[]>;
   /** Ask before every change on connections marked Production. */
   confirmProduction: boolean;
+  /** Keep a history of what clients change, for export. */
+  history: boolean;
 }
 
 /** How Mongo Studio calls for attention when an MCP request waits. */
@@ -109,6 +111,7 @@ export const useSettingsStore = create<SettingsState>()(
         connections: {},
         always: {},
         confirmProduction: true,
+        history: true,
       },
       setMcp: (patch) => set((s) => ({ mcp: { ...s.mcp, ...patch } })),
       mcpAlerts: { sound: true, focus: true },

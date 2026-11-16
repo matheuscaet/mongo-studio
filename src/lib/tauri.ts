@@ -21,7 +21,7 @@ import type {
   QueryResultPage,
 } from "../types/query";
 import type { MongoshInfo, MongoshRunOptions, SavedScript, ScriptResult } from "../types/script";
-import type { McpClientTarget, McpConfig, McpRequestChoice, McpStatus } from "../types/mcp";
+import type { McpClientTarget, McpConfig, McpHistoryEntry, McpRequestChoice, McpStatus } from "../types/mcp";
 import type {
   FindRelatedInput,
   FindRelatedOutput,
@@ -287,6 +287,14 @@ export const api = {
   mcpClientTargets: () => invoke<McpClientTarget[]>("mcp_client_targets"),
   mcpRegisterClient: (id: string) => invoke<McpClientTarget>("mcp_register_client", { id }),
   mcpUnregisterClient: (id: string) => invoke<McpClientTarget>("mcp_unregister_client", { id }),
+  /** The history of changes, newest first. */
+  mcpHistory: (filter: { connectionId?: string; since?: number; limit?: number }) =>
+    invoke<McpHistoryEntry[]>("mcp_history", { filter }),
+  mcpHistoryCount: () => invoke<number>("mcp_history_count"),
+  mcpHistoryClear: () => invoke<void>("mcp_history_clear"),
+  /** Writes the history to a file as Markdown or JSON; how many entries. */
+  mcpHistoryExport: (path: string, format: "markdown" | "json") =>
+    invoke<number>("mcp_history_export", { path, format }),
 
   relationsList: () => invoke<Relation[]>("relations_list"),
   relationSave: (relation: Relation) => invoke<Relation>("relation_save", { relation }),

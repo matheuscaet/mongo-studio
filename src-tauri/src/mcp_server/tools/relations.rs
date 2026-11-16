@@ -952,6 +952,7 @@ mod tests {
             always: HashMap::new(),
             alerts: Default::default(),
             confirm_production: true,
+            history: true,
         }
     }
 
@@ -1279,6 +1280,7 @@ mod live_tests {
                 always: HashMap::new(),
                 alerts: Default::default(),
                 confirm_production: true,
+                history: true,
             },
         );
         let client = add_session(&inner, "s1", "Live test");

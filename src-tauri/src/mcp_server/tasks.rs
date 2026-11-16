@@ -236,15 +236,27 @@ pub(crate) async fn run<F>(inner: &Arc<Inner>, task: Arc<Task>, work: F) -> Tool
 where
     F: std::future::Future<Output = ToolOutput> + Send + 'static,
 {
+    let handle = tokio::spawn(work);
+    task.set_abort(handle.abort_handle());
     let running = task.clone();
-    let handle = tokio::spawn(async move {
-        let output = work.await;
+    tokio::spawn(async move {
+        let output = match handle.await {
+            Ok(output) => output,
+            // Cancelled: the task already holds its answer.
+            Err(e) if e.is_cancelled() => return,
+            Err(_) => {
+                log::error!("MCP server: {} failed with an internal error", running.tool);
+                ToolOutput {
+                    text: "Mongo Studio hit an internal error running this call.".to_string(),
+                    is_error: true,
+                }
+            }
+        };
         // A cancelled task already holds its answer.
         if running.phase() != Phase::Done {
             running.finish(output);
         }
     });
-    task.set_abort(handle.abort_handle());
     if let Some(output) = task.wait(inner.inline_wait).await {
         return output;
     }

@@ -116,6 +116,15 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
     }
 
     let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut environments: Vec<&str> = profiles
+        .iter()
+        .filter_map(|p| p.environment.map(Environment::id))
+        .collect();
+    environments.dedup();
+    call.target.names = Some(names.join(", "));
+    call.target.ids = ids.clone();
+    call.target.environments = (!environments.is_empty()).then(|| environments.join(", "));
+    call.code = Some(code_on(&db, None, &script));
     // On production, every change is asked about.
     let guarded = config.confirm_production
         && mode == ScriptMode::Normal

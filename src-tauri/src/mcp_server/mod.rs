@@ -17,12 +17,14 @@
 
 mod clients;
 mod connections;
+mod history;
 mod policy;
 mod server;
 mod tasks;
 mod tools;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,8 @@ use crate::relations::RelationsStore;
 use crate::saved_scripts::SavedScriptsStore;
 use crate::secrets::SecretKind;
 use crate::state::AppState;
+
+pub use history::{HistoryEntry, HistoryFilter};
 
 pub const REQUEST_EVENT: &str = "mcp-request";
 pub const REQUEST_CLOSED_EVENT: &str = "mcp-request-closed";
@@ -124,6 +128,9 @@ pub struct McpConfig {
     /// when the capability is set to Allow or was allowed "always".
     #[serde(default = "default_true")]
     pub confirm_production: bool,
+    /// Keep a history of what clients change (`history`).
+    #[serde(default = "default_true")]
+    pub history: bool,
 }
 
 fn default_true() -> bool {
@@ -252,13 +259,19 @@ pub(crate) struct Inner {
     pool: connections::Pool,
     /// Calls that ran past `inline_wait`, for get_task and cancel_task.
     tasks: tasks::Tasks,
+    history: history::History,
     ask_timeout: Duration,
     inline_wait: Duration,
     client_paths: clients::Paths,
 }
 
 impl Inner {
-    fn new(host: Arc<dyn Host>, ask_timeout: Duration, client_paths: clients::Paths) -> Self {
+    fn new(
+        host: Arc<dyn Host>,
+        ask_timeout: Duration,
+        client_paths: clients::Paths,
+        history_path: PathBuf,
+    ) -> Self {
         Self {
             host,
             config: Mutex::new(McpConfig::default()),
@@ -270,6 +283,7 @@ impl Inner {
             approvals: Mutex::new(HashMap::new()),
             pool: connections::Pool::default(),
             tasks: tasks::Tasks::default(),
+            history: history::History::new(history_path),
             ask_timeout,
             inline_wait: INLINE_WAIT,
             client_paths,
@@ -442,13 +456,45 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(app: tauri::AppHandle) -> Self {
+        use tauri::Manager;
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("mongo-studio"));
         Self {
             inner: Arc::new(Inner::new(
                 Arc::new(app),
                 ASK_TIMEOUT,
                 clients::Paths::from_env(),
+                data_dir.join("mcp-history.jsonl"),
             )),
         }
+    }
+
+    /// The history's entries the filter picks, newest first.
+    pub fn history(&self, filter: &HistoryFilter) -> AppResult<Vec<HistoryEntry>> {
+        self.inner.history.list(filter)
+    }
+
+    pub fn history_count(&self) -> AppResult<usize> {
+        self.inner.history.count()
+    }
+
+    pub fn clear_history(&self) -> AppResult<()> {
+        self.inner.history.clear()?;
+        log::info!("MCP server: the history was cleared");
+        Ok(())
+    }
+
+    /// Writes the history to `path` as Markdown or JSON; how many entries.
+    pub fn export_history(&self, path: &str, format: &str) -> AppResult<usize> {
+        let entries = self.inner.history.list(&HistoryFilter::default())?;
+        let text = match format {
+            "json" => history::json(&entries),
+            _ => history::markdown(&entries),
+        };
+        std::fs::write(path, text)?;
+        Ok(entries.len())
     }
 
     /// Applies new settings: starts, stops or restarts the listener.
@@ -611,7 +657,12 @@ pub(crate) mod test_support {
     pub fn inner(ask_timeout: Duration) -> (Arc<TestHost>, Arc<Inner>) {
         let host = Arc::new(TestHost::new());
         let paths = clients::Paths::for_tests(&host.dir.join("home"));
-        let inner = Arc::new(Inner::new(host.clone(), ask_timeout, paths));
+        let inner = Arc::new(Inner::new(
+            host.clone(),
+            ask_timeout,
+            paths,
+            host.dir.join("mcp-history.jsonl"),
+        ));
         (host, inner)
     }
 

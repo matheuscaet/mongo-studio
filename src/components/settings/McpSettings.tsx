@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Bot, Check, Copy, Eye, EyeOff, Lock, Sparkles, Volume2, X } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
+import { Bot, Check, Copy, Download, Eye, EyeOff, Lock, Sparkles, Volume2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { ConnectionChip } from "@/components/ui/ConnectionChip";
@@ -9,6 +10,7 @@ import { connectionColor } from "@/lib/connectionColor";
 import { api } from "@/lib/tauri";
 import { playChime } from "@/lib/attention";
 import { cn } from "@/lib/utils";
+import { confirm } from "../../store/confirmStore";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { DEFAULT_MCP_PORT, useSettingsStore, type McpSettings as McpSettingsValue } from "../../store/settingsStore";
@@ -33,7 +35,7 @@ const CAP_GROUPS: { title: string; rows: CapRow[] }[] = [
     title: "Read",
     rows: [
       { id: "browse", label: "List databases, collections and indexes", help: "Names, counts and index definitions. Everything else needs it." },
-      { id: "read", label: "Read documents", help: "find, aggregate, count and explain, capped at 100 documents per call." },
+      { id: "read", label: "Read documents", help: "find, aggregate, count and explain, capped at 100 documents per call; also dry runs of writes and the history." },
     ],
   },
   {
@@ -41,7 +43,7 @@ const CAP_GROUPS: { title: string; rows: CapRow[] }[] = [
     rows: [
       { id: "write", label: "Insert, update and delete documents", help: "Each request shows what it changes and a dry-run count before it runs." },
       { id: "ddl", label: "Create and drop collections and indexes" },
-      { id: "script", label: "Run console scripts", help: "A script can do anything the connection's database user can." },
+      { id: "script", label: "Run console scripts", help: "A script can do anything the connection's database user can. Read-only and dry-run scripts need only Read access to the connection." },
     ],
   },
   {
@@ -411,6 +413,76 @@ function Activity() {
   );
 }
 
+/** What clients changed, kept on this computer: on/off, export, clear. */
+function History() {
+  const mcp = useSettingsStore((s) => s.mcp);
+  const setMcp = useSettingsStore((s) => s.setMcp);
+  // a new entry may follow any call
+  const activity = useMcpStore((s) => s.activity.length);
+  const [count, setCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    api.mcpHistoryCount().then(setCount, () => setCount(null));
+  }, [activity]);
+
+  async function exportHistory() {
+    const path = await save({
+      defaultPath: `mongo-studio-mcp-history-${new Date().toISOString().slice(0, 10)}.md`,
+      filters: [
+        { name: "Markdown", extensions: ["md"] },
+        { name: "JSON", extensions: ["json"] },
+      ],
+    });
+    if (!path) return;
+    try {
+      const n = await api.mcpHistoryExport(path, path.toLowerCase().endsWith(".json") ? "json" : "markdown");
+      toast.success(`Exported ${n} ${n === 1 ? "entry" : "entries"}`, { description: path });
+    } catch (e) {
+      toast.error("Couldn't export the history", { description: String(e) });
+    }
+  }
+
+  async function clearHistory() {
+    const ok = await confirm({
+      title: "Clear the history?",
+      message: "Every recorded change is deleted from this computer. Export it first if you need it.",
+      confirmLabel: "Clear",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.mcpHistoryClear();
+      setCount(0);
+    } catch (e) {
+      toast.error("Couldn't clear the history", { description: String(e) });
+    }
+  }
+
+  return (
+    <>
+      <SectionTitle>History</SectionTitle>
+      <SwitchField
+        label="Keep a history of changes"
+        description="Every write, schema change, connection edit and script a client runs: its code, when, where, who approved it and what it changed. Kept on this computer, up to the last 5,000; clients can read it back for the connections they may read."
+        checked={mcp.history ?? true}
+        onCheckedChange={(history) => setMcp({ history })}
+      />
+      <div className="ml-10 flex flex-wrap items-center gap-2 text-sm text-fg-2">
+        <span className="mr-auto">
+          {count === null ? "" : count === 0 ? "Nothing recorded yet." : `${count.toLocaleString()} ${count === 1 ? "entry" : "entries"} recorded.`}
+        </span>
+        <Button size="sm" variant="ghost" disabled={!count} onClick={() => void clearHistory()}>
+          Clear…
+        </Button>
+        <Button size="sm" disabled={!count} onClick={() => void exportHistory()}>
+          <Download />
+          Export…
+        </Button>
+      </div>
+    </>
+  );
+}
+
 /** How Mongo Studio calls for attention when a request set to Ask arrives. */
 function RequestAlerts() {
   const alerts = useSettingsStore((s) => s.mcpAlerts);
@@ -567,6 +639,7 @@ export function McpSettings() {
 
         <Clients />
         <Activity />
+        <History />
       </div>
     </>
   );

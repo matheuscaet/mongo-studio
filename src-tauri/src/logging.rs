@@ -45,7 +45,7 @@ pub fn init_local_offset() {
         .get_or_init(|| time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
 }
 
-fn local_offset() -> time::UtcOffset {
+pub(crate) fn local_offset() -> time::UtcOffset {
     LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC)
 }
 

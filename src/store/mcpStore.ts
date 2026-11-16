@@ -72,6 +72,7 @@ function configOf(mcp: McpSettings, alerts: McpAlerts): McpConfig {
     always: mcp.always,
     alerts,
     confirmProduction: mcp.confirmProduction ?? true,
+    history: mcp.history ?? true,
   };
 }
 
