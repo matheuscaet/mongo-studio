@@ -139,6 +139,9 @@ pub(crate) struct Request {
     pub title: String,
     pub code: String,
     pub dry_run: Option<String>,
+    /// Every connection a call on several is about; "always" is kept for
+    /// each of them.
+    pub connection_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -250,11 +253,17 @@ async fn wait_for_answer(
     match tokio::time::timeout(inner.ask_timeout, rx).await {
         Ok(Ok(RequestChoice::Once)) => Answer::Once,
         Ok(Ok(RequestChoice::Always)) => {
-            let key = request
-                .connection_id
-                .clone()
-                .unwrap_or_else(|| ANY_CONNECTION.to_string());
-            remember_always(inner, &key, request.capability);
+            if request.connection_ids.is_empty() {
+                let key = request
+                    .connection_id
+                    .clone()
+                    .unwrap_or_else(|| ANY_CONNECTION.to_string());
+                remember_always(inner, &key, request.capability);
+            } else {
+                for id in &request.connection_ids {
+                    remember_always(inner, id, request.capability);
+                }
+            }
             Answer::Always
         }
         Ok(Ok(RequestChoice::Deny)) => Answer::Deny,
@@ -427,6 +436,7 @@ pub(crate) mod tests {
 
     fn request() -> Request {
         Request {
+            connection_ids: Vec::new(),
             tool: "update_documents",
             capability: Cap::Write,
             connection_id: Some("c1".into()),

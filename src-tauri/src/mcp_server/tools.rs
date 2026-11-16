@@ -12,6 +12,7 @@
 //! documents or scripts.
 
 mod documents;
+mod many;
 mod relations;
 
 use std::sync::{Arc, Mutex};
@@ -85,6 +86,7 @@ pub(crate) enum Tool {
     CreateIndex,
     DropIndex,
     RunScript,
+    RunScriptOnConnections,
     CreateConnection,
     UpdateConnection,
     DeleteConnection,
@@ -112,7 +114,7 @@ enum Scope {
 }
 
 impl Tool {
-    const ALL: [Tool; 32] = [
+    const ALL: [Tool; 33] = [
         Tool::ListConnections,
         Tool::ListDatabases,
         Tool::ListCollections,
@@ -131,6 +133,7 @@ impl Tool {
         Tool::CreateIndex,
         Tool::DropIndex,
         Tool::RunScript,
+        Tool::RunScriptOnConnections,
         Tool::CreateConnection,
         Tool::UpdateConnection,
         Tool::DeleteConnection,
@@ -171,6 +174,7 @@ impl Tool {
             Tool::CreateIndex => "create_index",
             Tool::DropIndex => "drop_index",
             Tool::RunScript => "run_script",
+            Tool::RunScriptOnConnections => "run_script_on_connections",
             Tool::CreateConnection => "create_connection",
             Tool::UpdateConnection => "update_connection",
             Tool::DeleteConnection => "delete_connection",
@@ -208,7 +212,7 @@ impl Tool {
             Tool::CreateCollection | Tool::DropCollection | Tool::CreateIndex | Tool::DropIndex => {
                 Cap::Ddl
             }
-            Tool::RunScript => Cap::Script,
+            Tool::RunScript | Tool::RunScriptOnConnections => Cap::Script,
             Tool::CreateConnection | Tool::UpdateConnection => Cap::ConnEdit,
             Tool::DeleteConnection => Cap::ConnDelete,
             Tool::SaveScript => Cap::SaveScript,
@@ -234,7 +238,9 @@ impl Tool {
             | Tool::UpdateRelation
             | Tool::DeleteRelation
             | Tool::GetTask
-            | Tool::CancelTask => Scope::Nothing,
+            | Tool::CancelTask
+            // its connections are checked one by one, in `many`
+            | Tool::RunScriptOnConnections => Scope::Nothing,
             // The From (or source) connection; the other side's is resolved
             // from the relation and checked too.
             Tool::TestRelation | Tool::FindRelated => Scope::Connection,
@@ -263,6 +269,7 @@ impl Tool {
                 | Tool::DeleteRelation
                 | Tool::GetTask
                 | Tool::CancelTask
+                | Tool::RunScriptOnConnections
         )
     }
 
@@ -271,7 +278,9 @@ impl Tool {
     fn changes_data(self, args: &Value) -> bool {
         match self {
             Tool::Aggregate => aggregate_writes(args),
-            Tool::RunScript => script_mode(args) == ScriptMode::Normal,
+            Tool::RunScript | Tool::RunScriptOnConnections => {
+                script_mode(args) == ScriptMode::Normal
+            }
             tool if documents::is_dry_run(tool, args) => false,
             tool => !matches!(
                 tool.cap(),
@@ -357,6 +366,12 @@ fn all_definitions() -> Vec<Value> {
         req.extend_from_slice(required);
         on_db(Value::Object(properties), &req)
     };
+    let script_props = json!({
+        "script": { "type": "string", "description": "The script, e.g. const n = await db.orders.countDocuments({ status: \"open\" }); n" },
+        "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS, "description": "The script is stopped (and the query it waits on) after this long; writes made before stay." },
+        "read_only": { "type": "boolean", "default": false, "description": "Refuse every write: the first one stops the script. Needs only read access to the connection." },
+        "dry_run": { "type": "boolean", "default": false, "description": "Don't write anything: each write is counted and reported (how many documents it would insert, change or delete) and gets a made-up result. Reads later in the script don't see those writes. Needs only read access." },
+    });
     // In `Tool::ALL` order.
     let mut defs = vec![
         json!({
@@ -503,12 +518,25 @@ fn all_definitions() -> Vec<Value> {
         json!({
             "name": "run_script",
             "description": "Run JavaScript on a database with Mongo Studio's built-in engine, which speaks most of mongosh's API with top-level await (not the full mongosh: await every call). It has db.<collection> and db.getCollection(name) with find(filter, projection, options) returning a cursor (sort, limit, skip, project, hint, maxTimeMS, allowDiskUse, collation, map, toArray, forEach, hasNext/next, for await), findOne, aggregate(pipeline, options) (a cursor too), countDocuments, estimatedDocumentCount, distinct, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne, deleteMany, findOneAndUpdate/Replace/Delete, bulkWrite, getIndexes, createIndex and drop, each taking the same options as in mongosh (an option the engine doesn't support is an error, never ignored); plus db.getName(), db.getSiblingDB(name), db.getCollectionNames(), db.runCommand(cmd), `use <db>` lines, print/printjson/console.log and `await sleep(ms)`. Dates (new Date(), ISODate()), ObjectId(), NumberLong(), NumberInt(), NumberDecimal(), UUID() and regexes are stored as their BSON types and come back as such. `await cursor` without toArray() returns at most 1000 documents. Returns the last expression's value as relaxed Extended JSON, what the script printed, and what its writes changed. A script that writes needs write access and may need the user's approval; with read_only it needs only read access and any write stops it, and with dry_run no write is made: each is counted (how many documents it would touch) and reported instead. A call that runs past about 40 seconds goes on in the background (see get_task).",
-            "inputSchema": on_db(json!({
-                "script": { "type": "string", "description": "The script, e.g. const n = await db.orders.countDocuments({ status: \"open\" }); n" },
-                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS, "description": "The script is stopped (and the query it waits on) after this long; writes made before stay." },
-                "read_only": { "type": "boolean", "default": false, "description": "Refuse every write: the first one stops the script. Needs only read access to the connection." },
-                "dry_run": { "type": "boolean", "default": false, "description": "Don't write anything: each write is counted and reported (how many documents it would insert, change or delete) and gets a made-up result. Reads later in the script don't see those writes. Needs only read access." },
-            }), &["script"]),
+            "inputSchema": on_db(script_props.clone(), &["script"]),
+            "annotations": destructive,
+        }),
+        json!({
+            "name": "run_script_on_connections",
+            "description": "Run the same script on several connections, one after the other, and get each one's result, what it printed and what it changed - e.g. the same fix on every tenant's cluster. Same engine and arguments as run_script, with connection_ids instead of connection_id; the database must have the same name on each. When the user has to approve it, they are asked once for all the connections. A failure on one connection doesn't stop the others unless stop_on_error is true; timeout_ms applies to each connection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 20, "description": "Ids of saved connections, from list_connections." },
+                    "database": database.clone(),
+                    "script": script_props["script"].clone(),
+                    "timeout_ms": script_props["timeout_ms"].clone(),
+                    "read_only": script_props["read_only"].clone(),
+                    "dry_run": script_props["dry_run"].clone(),
+                    "stop_on_error": { "type": "boolean", "default": false, "description": "Don't run on the connections after the first failure." },
+                },
+                "required": ["connection_ids", "database", "script"],
+            },
             "annotations": destructive,
         }),
         json!({
@@ -794,6 +822,10 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
     }
 
+    if tool == Tool::RunScriptOnConnections {
+        return many::run(call, args).await;
+    }
+
     let config = call.inner.config();
     let cap = match tool {
         Tool::Aggregate if aggregate_writes(args) => Cap::Write,
@@ -893,6 +925,7 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
                 title: plan.title.clone(),
                 code: truncate(plan.code.clone(), MAX_CODE),
                 dry_run: plan.dry_run.clone(),
+                connection_ids: Vec::new(),
             };
             match policy::ask(call.inner, call.client, &request).await {
                 Answer::Once => "Approved by you",
@@ -3577,6 +3610,96 @@ mod live_tests {
         let out = run(&inner, "count", on(&coll, json!({}))).await;
         assert!(out.text.starts_with("2 documents"), "{}", out.text);
         run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        inner.pool.close_all("test over").await;
+    }
+
+    /// One script on two connections: one approval, a result per
+    /// connection, "always" kept for both.
+    #[tokio::test]
+    #[ignore]
+    async fn live_one_script_on_several_connections() {
+        let (host, inner) = setup(Duration::from_secs(5));
+        let second = std::env::var("MONGO_STUDIO_TEST_URI_2")
+            .unwrap_or_else(|_| "mongodb://localhost:27018".into());
+        host.state
+            .connection_store
+            .upsert(profile("live2", "Live 2", &second))
+            .unwrap();
+        {
+            let mut config = inner.config.lock().unwrap();
+            config.connections.insert("live2".into(), Level::Write);
+            config.caps.insert("script".into(), Policy::Ask);
+        }
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let args = json!({ "connection_ids": ["live", "live2"], "database": TEST_DB,
+            "script": format!("await db.{coll}.insertOne({{ at: new Date() }}); print('on ' + db.getName()); await db.{coll}.countDocuments({{}})") });
+        let waiting = {
+            let inner = inner.clone();
+            let args = args.clone();
+            tokio::spawn(async move { run(&inner, "run_script_on_connections", args).await })
+        };
+        let request = loop {
+            if let Some(event) = host.events_named(REQUEST_EVENT).pop() {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(request["connectionName"], "Live, Live 2");
+        assert_eq!(
+            request["title"],
+            format!("Run a script on 2 connections ({TEST_DB})")
+        );
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            RequestChoice::Always,
+        )
+        .unwrap();
+        let out = waiting.await.unwrap();
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.starts_with(&format!(
+                "Ran the script on {TEST_DB} on 2 of 2 connections. Changed in all: 2 inserted."
+            )),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("## Live (live)") && out.text.contains("## Live 2 (live2)"),
+            "{}",
+            out.text
+        );
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        let always = &inner.config().always;
+        assert!(
+            always["live"].contains(&"script".to_string())
+                && always["live2"].contains(&"script".to_string())
+        );
+
+        // Now allowed for both without asking; a read-only connection refuses it.
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live2".into(), Level::Read);
+        let out = run(&inner, "run_script_on_connections", args.clone()).await;
+        assert!(
+            out.is_error && out.text.contains("On Live 2") && out.text.contains("read_only: true"),
+            "{}",
+            out.text
+        );
+        let mut read = args;
+        read["script"] = json!(format!("await db.{coll}.drop()"));
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live2".into(), Level::Write);
+        let out = run(&inner, "run_script_on_connections", read).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
         inner.pool.close_all("test over").await;
     }
 
