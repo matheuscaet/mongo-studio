@@ -40,9 +40,11 @@ list_databases, list_collections, sample_schema (field names and types) and list
 learn the data before querying it with find, count, aggregate or explain. Every tool that \
 works on data takes a connection_id from list_connections. The user decides in Mongo Studio's \
 settings what you may do: some tools may be turned off, each connection is read-only or \
-read & write, and some calls wait until the user approves them in the app (up to two minutes) \
-- when that happens, tell the user to look at Mongo Studio. A refusal means the user hasn't \
-allowed it; don't retry, ask them. Passwords are never available through this server: \
+read & write, and some calls wait until the user approves them in the app - when that \
+happens, tell the user to look at Mongo Studio. A call that takes more than about 40 seconds \
+(waiting for that approval, or a long script or query) answers at once with a task_id and goes \
+on in the background: follow it with get_task, stop it with cancel_task, and don't make the \
+call again. A refusal means the user hasn't allowed it; don't retry, ask them. Passwords are never available through this server: \
 connections you create are saved without one, and the user adds it in the app. Relations are \
 the user's saved links between collections in different databases or connections (MongoDB's \
 $lookup can't cross databases): list_relations shows them and find_related joins through one, \
@@ -170,6 +172,7 @@ async fn stop(inner: &Arc<Inner>) {
         log::info!("MCP server stopped listening on port {}", listener.port);
     }
     inner.sessions.lock().unwrap().clear();
+    inner.tasks.cancel_all();
     policy::close_all_requests(inner);
     inner.pool.close_all("the MCP server stopped").await;
 }

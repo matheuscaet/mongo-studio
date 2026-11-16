@@ -24,6 +24,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::policy::{self, Answer, Cap, Decision, Request};
+use super::tasks::{self, Phase, Task};
 use super::{
     now_ms, ClientSession, Inner, Level, McpConfig, Policy, ACTIVITY_EVENT, CONNECTION_EVENT,
 };
@@ -52,6 +53,9 @@ const MAX_DOCS: i64 = 100;
 const MAX_INSERT: usize = 1000;
 const DEFAULT_SCRIPT_MS: i64 = 30_000;
 const MAX_SCRIPT_MS: i64 = 300_000;
+const DEFAULT_TASK_WAIT_MS: i64 = 30_000;
+/// Under the minute many clients wait for a request.
+const MAX_TASK_WAIT_MS: i64 = 45_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tool {
@@ -84,6 +88,8 @@ pub(crate) enum Tool {
     TestRelation,
     FindRelated,
     DeleteRelation,
+    GetTask,
+    CancelTask,
 }
 
 /// What a tool works on, and so which of connection_id, database and
@@ -97,7 +103,7 @@ enum Scope {
 }
 
 impl Tool {
-    const ALL: [Tool; 29] = [
+    const ALL: [Tool; 31] = [
         Tool::ListConnections,
         Tool::ListDatabases,
         Tool::ListCollections,
@@ -127,6 +133,8 @@ impl Tool {
         Tool::TestRelation,
         Tool::FindRelated,
         Tool::DeleteRelation,
+        Tool::GetTask,
+        Tool::CancelTask,
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -164,6 +172,8 @@ impl Tool {
             Tool::TestRelation => "test_relation",
             Tool::FindRelated => "find_related",
             Tool::DeleteRelation => "delete_relation",
+            Tool::GetTask => "get_task",
+            Tool::CancelTask => "cancel_task",
         }
     }
 
@@ -172,6 +182,8 @@ impl Tool {
     /// and find_related also needs `read`, see `call`.
     fn cap(self) -> Cap {
         match self {
+            // About calls the client already made, each checked then.
+            Tool::GetTask | Tool::CancelTask => Cap::Browse,
             Tool::ListConnections => Cap::ConnList,
             Tool::ListDatabases
             | Tool::ListCollections
@@ -206,7 +218,9 @@ impl Tool {
             | Tool::SuggestRelationLinks
             | Tool::CreateRelation
             | Tool::UpdateRelation
-            | Tool::DeleteRelation => Scope::Nothing,
+            | Tool::DeleteRelation
+            | Tool::GetTask
+            | Tool::CancelTask => Scope::Nothing,
             // The From (or source) connection; the other side's is resolved
             // from the relation and checked too.
             Tool::TestRelation | Tool::FindRelated => Scope::Connection,
@@ -233,7 +247,21 @@ impl Tool {
                 | Tool::CreateRelation
                 | Tool::UpdateRelation
                 | Tool::DeleteRelation
+                | Tool::GetTask
+                | Tool::CancelTask
         )
+    }
+
+    /// Whether the call may change data or settings, so running it twice
+    /// would repeat the change.
+    fn changes_data(self, args: &Value) -> bool {
+        match self {
+            Tool::Aggregate => aggregate_writes(args),
+            tool => !matches!(
+                tool.cap(),
+                Cap::Browse | Cap::Read | Cap::ConnList | Cap::RelRead
+            ),
+        }
     }
 
     fn is_relation_tool(self) -> bool {
@@ -490,9 +518,31 @@ fn all_definitions() -> Vec<Value> {
         }),
     ];
     defs.extend(relations::definitions());
+    let task_id = json!({ "type": "string", "description": "The task_id a call answered with when it went on in the background." });
+    defs.push(json!({
+        "name": "get_task",
+        "description": "Follow a call that went on in the background: a call that takes more than about 40 seconds (waiting for the user's approval, or a long script or query) answers with a task_id instead of its result. This waits up to wait_ms for it to end and returns its result, or else its status and the lines it printed so far.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": task_id,
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_TASK_WAIT_MS, "default": DEFAULT_TASK_WAIT_MS, "description": "How long to wait for the task to end before answering with its status." },
+                "from_line": { "type": "integer", "minimum": 0, "default": 0, "description": "Show printed lines from this index on (the previous status says which to pass)." },
+            },
+            "required": ["task_id"],
+        },
+        "annotations": read_only,
+    }));
+    defs.push(json!({
+        "name": "cancel_task",
+        "description": "Stop a call that went on in the background: withdraws a request still waiting for the user's approval, or stops a running script or query. Changes already made are kept.",
+        "inputSchema": { "type": "object", "properties": { "task_id": task_id }, "required": ["task_id"] },
+        "annotations": writes,
+    }));
     defs
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct ToolOutput {
     pub text: String,
     pub is_error: bool,
@@ -574,6 +624,8 @@ struct Call<'a> {
     tool: Tool,
     target: Target,
     started: Instant,
+    /// Followed by get_task when the call outlasts `inline_wait`.
+    task: Arc<Task>,
 }
 
 impl Call<'_> {
@@ -644,14 +696,33 @@ pub(crate) async fn call(
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
     };
-    let mut call = Call {
-        inner,
-        client,
-        tool,
-        target: Target::default(),
-        started: Instant::now(),
+    let task_id = str_arg(&args, "task_id").unwrap_or_default();
+    match tool {
+        Tool::GetTask => {
+            let wait = opt_int_arg(&args, "wait_ms")
+                .unwrap_or(DEFAULT_TASK_WAIT_MS)
+                .clamp(0, MAX_TASK_WAIT_MS);
+            let from_line = opt_int_arg(&args, "from_line").unwrap_or(0).max(0) as usize;
+            let wait = Duration::from_millis(wait as u64);
+            return Some(tasks::get(inner, &task_id, wait, from_line).await);
+        }
+        Tool::CancelTask => return Some(tasks::cancel(inner, &task_id)),
+        _ => {}
+    }
+    let task = Task::new(&client.id, tool.name(), tool.changes_data(&args));
+    let (owned_inner, owned_client, followed) = (inner.clone(), client.clone(), task.clone());
+    let work = async move {
+        let mut call = Call {
+            inner: &owned_inner,
+            client: &owned_client,
+            tool,
+            target: Target::default(),
+            started: Instant::now(),
+            task: followed,
+        };
+        run_call(&mut call, &args).await
     };
-    Some(run_call(&mut call, &args).await)
+    Some(tasks::run(inner, task, work).await)
 }
 
 async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
@@ -752,6 +823,7 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         Decision::Allow => "Allowed",
         Decision::AllowAlways => "Allowed (always)",
         _ => {
+            call.task.set_phase(Phase::Approval);
             let request = Request {
                 tool: tool.name(),
                 capability: cap,
@@ -773,6 +845,7 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
     };
 
+    call.task.set_phase(Phase::Running);
     let timeout = match tool {
         Tool::RunScript => {
             Duration::from_millis(script_timeout(args) as u64) + Duration::from_secs(30)
@@ -1457,6 +1530,7 @@ async fn execute(
                     let timeout = script_timeout(args) as u64;
                     let printed = Arc::new(Mutex::new(Vec::<String>::new()));
                     let sink = printed.clone();
+                    let task = call.task.clone();
                     // Stops the script, and the query it waits on, when the
                     // call ends early: past timeout_ms, or dropped.
                     let stop = CancelOnDrop(CancelToken::default());
@@ -1468,7 +1542,10 @@ async fn execute(
                         // the one below also stops a query in flight.
                         Some(timeout + 5_000),
                         stop.0.clone(),
-                        move |line| sink.lock().unwrap().push(line),
+                        move |line: String| {
+                            task.print(line.clone());
+                            sink.lock().unwrap().push(line);
+                        },
                     ));
                     let result = tokio::select! {
                         result = run => result?,
@@ -2218,7 +2295,9 @@ mod tests {
                 "list_databases",
                 "list_collections",
                 "list_indexes",
-                "sample_schema"
+                "sample_schema",
+                "get_task",
+                "cancel_task"
             ]
         );
         let more = names(&config(
@@ -2544,6 +2623,90 @@ mod tests {
         assert_eq!(last_activity(&host)["label"], "Not answered");
     }
 
+    /// A request nobody answers within inline_wait comes back as a task
+    /// that says it waits for the user; the answer arrives via get_task.
+    #[tokio::test]
+    async fn a_call_waiting_for_approval_goes_on_as_a_task() {
+        let (host, mut inner) = inner(Duration::from_secs(5));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(50));
+        set_policy(&inner, config(&[("saveScript", Policy::Ask)], &[]));
+        let args = json!({ "name": "report", "content": "db.orders.find()" });
+        let out = run(&inner, "save_script", args.clone()).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("Waiting for the user to approve this in Mongo Studio"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Don't call save_script again"),
+            "{}",
+            out.text
+        );
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+
+        // Still waiting: get_task says so after its wait.
+        let status = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": "20" }),
+        )
+        .await;
+        assert!(
+            status.text.starts_with("Waiting for the user"),
+            "{}",
+            status.text
+        );
+
+        let request = host.events_named(REQUEST_EVENT).pop().unwrap();
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            super::super::RequestChoice::Once,
+        )
+        .unwrap();
+        let done = run(&inner, "get_task", json!({ "task_id": task_id })).await;
+        assert!(!done.is_error, "{}", done.text);
+        assert!(
+            done.text.contains("(save_script) finished"),
+            "{}",
+            done.text
+        );
+        assert_eq!(host.scripts.list().unwrap().len(), 1);
+
+        // Cancelling withdraws the card and runs nothing.
+        let out = run(&inner, "save_script", args).await;
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let cancelled = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert!(
+            cancelled.text.starts_with("Withdrew the request"),
+            "{}",
+            cancelled.text
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            host.events_named(REQUEST_CLOSED_EVENT).pop().unwrap()["reason"],
+            "cancelled"
+        );
+        assert!(inner.approvals.lock().unwrap().is_empty());
+        let after = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": 0 }),
+        )
+        .await;
+        assert!(
+            after.is_error && after.text.contains("Cancelled"),
+            "{}",
+            after.text
+        );
+        assert_eq!(host.scripts.list().unwrap().len(), 1);
+
+        let unknown = run(&inner, "get_task", json!({ "task_id": "nope" })).await;
+        assert!(unknown.is_error);
+    }
+
     #[tokio::test]
     async fn save_script_approved_writes_the_file() {
         let (host, inner) = inner(Duration::from_secs(5));
@@ -2842,6 +3005,68 @@ mod live_tests {
             .drop()
             .await
             .unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// A script that outlasts inline_wait goes on in the background, with
+    /// what it printed so far; get_task brings its result, cancel_task
+    /// stops another one.
+    #[tokio::test]
+    #[ignore]
+    async fn live_long_scripts_go_on_as_tasks() {
+        let (host, mut inner) = setup(Duration::from_secs(1));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(300));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let c = format!("db.getCollection('{coll}')");
+        let script = format!(
+            "await {c}.insertMany([{{a:1}},{{a:2}}]); print('inserted'); \
+             const n = (await {c}.find({{ $where: 'sleep(400) || true' }})).length; print('read ' + n); n"
+        );
+        let args = json!({ "connection_id": "live", "database": TEST_DB, "script": script });
+        let out = run(&inner, "run_script", args.clone()).await;
+        assert!(out.text.starts_with("Still running after"), "{}", out.text);
+        assert!(
+            out.text.contains("Don't call run_script again"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("inserted"), "{}", out.text);
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let done = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": 5000 }),
+        )
+        .await;
+        assert!(!done.is_error, "{}", done.text);
+        assert!(done.text.contains("(run_script) finished"), "{}", done.text);
+        assert!(done.text.contains("read 2"), "{}", done.text);
+
+        let out = run(&inner, "run_script", args).await;
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let stopped = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert!(
+            stopped.text.starts_with("Stopped run_script"),
+            "{}",
+            stopped.text
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        // The second run inserted, then was stopped while reading.
+        assert_eq!(c.count_documents(doc! {}).await.unwrap(), 4);
+        c.drop().await.unwrap();
         inner.pool.close_all("test over").await;
     }
 

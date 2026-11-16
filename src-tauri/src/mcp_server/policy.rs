@@ -217,9 +217,28 @@ pub(crate) async fn ask(inner: &Inner, client: &ClientSession, request: &Request
             request.title
         ),
     );
-    let answer = wait_for_answer(inner, request, &request_id, rx).await;
-    inner.dismiss_attention();
-    answer
+    let _withdraw = Withdraw {
+        inner,
+        request_id: &request_id,
+    };
+    wait_for_answer(inner, request, &request_id, rx).await
+}
+
+/// Takes the card away when the call stops waiting for any reason - also
+/// when it is dropped (the client cancelled its task).
+struct Withdraw<'a> {
+    inner: &'a Inner,
+    request_id: &'a str,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        let pending = self.inner.approvals.lock().unwrap().remove(self.request_id);
+        if pending.is_some() {
+            emit_closed(self.inner, self.request_id, "cancelled");
+        }
+        self.inner.dismiss_attention();
+    }
 }
 
 async fn wait_for_answer(
