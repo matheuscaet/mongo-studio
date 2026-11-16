@@ -120,6 +120,14 @@ pub struct McpConfig {
     pub always: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub alerts: McpAlerts,
+    /// Ask before every change on a connection marked production, even
+    /// when the capability is set to Allow or was allowed "always".
+    #[serde(default = "default_true")]
+    pub confirm_production: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]

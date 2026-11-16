@@ -478,6 +478,7 @@ mod live_tests {
             id: profile_id,
             name: "live export test".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: stripped_uri },
             database: None,
             username,

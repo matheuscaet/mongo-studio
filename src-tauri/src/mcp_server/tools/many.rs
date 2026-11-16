@@ -13,7 +13,7 @@ use crate::logging;
 use crate::mcp_server::policy::{self, Answer, Cap, Decision, Request};
 use crate::mcp_server::tasks::Phase;
 use crate::mcp_server::Level;
-use crate::models::ConnectionProfile;
+use crate::models::{ConnectionProfile, Environment};
 use crate::scripting::{ScriptMode, WriteTally};
 
 /// Connections per call.
@@ -116,7 +116,13 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
     }
 
     let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-    let label = if decisions.contains(&Decision::Ask) {
+    // On production, every change is asked about.
+    let guarded = config.confirm_production
+        && mode == ScriptMode::Normal
+        && profiles
+            .iter()
+            .any(|p| p.environment == Some(Environment::Production));
+    let label = if guarded || decisions.contains(&Decision::Ask) {
         call.task.set_phase(Phase::Approval);
         let verb = match mode {
             ScriptMode::Normal => "Run a script",
@@ -137,6 +143,7 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
             code: truncate(code_on(&db, None, &script), MAX_CODE),
             dry_run: None,
             connection_ids: ids.clone(),
+            production: guarded,
         };
         match policy::ask(call.inner, call.client, &request).await {
             Answer::Once => "Approved by you",

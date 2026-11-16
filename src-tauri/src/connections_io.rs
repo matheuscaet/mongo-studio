@@ -434,6 +434,7 @@ mod tests {
             id: id.to_string(),
             name: "My cluster".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: "mongodb://cluster0.example.net/mydb".to_string(),
             },

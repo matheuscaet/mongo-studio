@@ -64,7 +64,15 @@ export const useMcpStore = create<McpState>((set, get) => ({
 }));
 
 function configOf(mcp: McpSettings, alerts: McpAlerts): McpConfig {
-  return { enabled: mcp.enabled, port: mcp.port, caps: { ...mcp.caps, browse: "allow" }, connections: mcp.connections, always: mcp.always, alerts };
+  return {
+    enabled: mcp.enabled,
+    port: mcp.port,
+    caps: { ...mcp.caps, browse: "allow" },
+    connections: mcp.connections,
+    always: mcp.always,
+    alerts,
+    confirmProduction: mcp.confirmProduction ?? true,
+  };
 }
 
 let started = false;

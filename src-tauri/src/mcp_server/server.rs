@@ -457,6 +457,7 @@ mod tests {
             connections: HashMap::from([("c1".to_string(), Level::Read)]),
             always: HashMap::new(),
             alerts: Default::default(),
+            confirm_production: true,
         }
     }
 

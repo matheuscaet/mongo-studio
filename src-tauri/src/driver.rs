@@ -852,6 +852,7 @@ mod tests {
             id: "conn".to_string(),
             name: "test".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: "mongodb://localhost:27017/".to_string(),
             },
@@ -1002,6 +1003,7 @@ mod live_tests {
             id: profile_id,
             name: "live test".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: stripped_uri },
             database: None,
             username,

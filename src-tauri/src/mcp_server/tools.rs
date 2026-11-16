@@ -38,7 +38,7 @@ use crate::connection::extract_uri_credentials;
 use crate::ejson::{bson_to_json, document_to_json, json_to_document};
 use crate::error::{AppError, AppResult};
 use crate::logging::{self, Detail, Op};
-use crate::models::{ConnectionProfile, ConnectionSource};
+use crate::models::{ConnectionProfile, ConnectionSource, Environment};
 use crate::scripting::{ScriptExecutionResult, ScriptMode};
 use crate::state::CancelToken;
 
@@ -342,6 +342,7 @@ fn all_definitions() -> Vec<Value> {
     let read_only =
         json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
     let dry_run = json!({ "type": "boolean", "default": false, "description": "Change nothing: report how many documents would change. Needs only read access." });
+    let environment = json!({ "type": "string", "enum": ["development", "testing", "staging", "production", "none"], "description": "What the connection is for. On production connections, the user is asked before every change. Only the user can take a connection out of production." });
     let writes = json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false });
     let destructive =
         json!({ "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false });
@@ -376,7 +377,7 @@ fn all_definitions() -> Vec<Value> {
     let mut defs = vec![
         json!({
             "name": "list_connections",
-            "description": "List the MongoDB connections saved in Mongo Studio that you may use: id, name, sidebar folder, hosts, default database and your access level (read or write). Start here: every other data tool takes a connection_id from this list. Passwords and full connection strings are never shown.",
+            "description": "List the MongoDB connections saved in Mongo Studio that you may use: id, name, sidebar folder, environment (development, testing, staging, production, or null when not set), hosts, replica set, default database and your access level (read or write). On production connections the user is asked before every change. Start here: every other data tool takes a connection_id from this list. Passwords and full connection strings are never shown.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": read_only,
         }),
@@ -548,6 +549,7 @@ fn all_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "Name shown in Mongo Studio's sidebar." },
                     "uri": { "type": "string", "description": "mongodb:// or mongodb+srv:// connection string, preferably without a password." },
                     "folder": { "type": "string", "description": "Name of an existing sidebar folder to put it in." },
+                    "environment": environment.clone(),
                 },
                 "required": ["name", "uri"],
             },
@@ -562,6 +564,7 @@ fn all_definitions() -> Vec<Value> {
                     "connection_id": connection_id,
                     "name": { "type": "string", "description": "New name." },
                     "uri": { "type": "string", "description": "New mongodb:// or mongodb+srv:// connection string." },
+                    "environment": environment,
                 },
                 "required": ["connection_id"],
             },
@@ -915,6 +918,18 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
     }
 
+    // On production, every change is asked about.
+    let production = call
+        .target
+        .profile
+        .as_ref()
+        .is_some_and(|p| p.environment == Some(Environment::Production));
+    let guarded = production && config.confirm_production && call.task.changes_data;
+    let decision = match decision {
+        Decision::Allow | Decision::AllowAlways if guarded => Decision::Ask,
+        other => other,
+    };
+
     if tool.is_relation_tool() {
         match relations::prepare(call, args) {
             Ok(relations::Access::Granted) => {}
@@ -961,6 +976,7 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
                 code: truncate(plan.code.clone(), MAX_CODE),
                 dry_run: plan.dry_run.clone(),
                 connection_ids: Vec::new(),
+                production: guarded,
             };
             match policy::ask(call.inner, call.client, &request).await {
                 Answer::Once => "Approved by you",
@@ -1671,16 +1687,25 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
             if let Some(folder) = &new.folder {
                 code.push_str(&format!("\nfolder: {folder}"));
             }
+            if let Some(environment) = new.environment {
+                code.push_str(&format!("\nenvironment: {}", environment.id()));
+            }
             plan(format!("Save a new connection \"{}\"", new.name), code)
         }
         Tool::UpdateConnection => {
             let change = connection_change_args(args)?;
+            let current = t.profile.as_ref().and_then(|p| p.environment);
+            check_environment_change(current, change.environment)?;
             let mut code = String::new();
             if let Some(name) = &change.name {
                 code.push_str(&format!("name: {name}\n"));
             }
             if let Some(uri) = &change.uri {
                 code.push_str(&format!("uri: {uri}\n"));
+            }
+            if let Some(environment) = change.environment {
+                let id = environment.map_or("none", Environment::id);
+                code.push_str(&format!("environment: {id}\n"));
             }
             plan(
                 format!("Edit the connection \"{}\"", t.connection_name()),
@@ -2329,7 +2354,9 @@ fn list_connections(inner: &Inner) -> Done {
                 "id": profile.id,
                 "name": profile.name,
                 "folder": folders.get(&profile.id).map(|(_, label)| label.clone()),
+                "environment": profile.environment.map(Environment::id),
                 "hosts": logging::host_summary(&profile),
+                "replicaSet": profile.advanced.replica_set,
                 "database": profile.database,
                 "access": if level == Level::Write { "read & write" } else { "read" },
             }))
@@ -2356,6 +2383,7 @@ struct NewConnection {
     username: Option<String>,
     had_password: bool,
     folder: Option<String>,
+    environment: Option<Environment>,
 }
 
 fn checked_uri(uri: &str) -> AppResult<(String, Option<String>, bool)> {
@@ -2387,7 +2415,41 @@ fn new_connection_args(args: &Value) -> AppResult<NewConnection> {
         username,
         had_password,
         folder: str_arg(args, "folder"),
+        environment: environment_arg(args)?.flatten(),
     })
+}
+
+/// A client may mark a connection production, never unmark it.
+fn check_environment_change(
+    current: Option<Environment>,
+    change: Option<Option<Environment>>,
+) -> AppResult<()> {
+    match change {
+        Some(new)
+            if current == Some(Environment::Production) && new != Some(Environment::Production) =>
+        {
+            Err(invalid(
+                "This connection is marked production, and only the user can change that, in \
+                 Mongo Studio.",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `environment`: absent (`None`), cleared (`Some(None)`) or set.
+fn environment_arg(args: &Value) -> AppResult<Option<Option<Environment>>> {
+    match args.get("environment") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("none") => {
+            Ok(Some(None))
+        }
+        Some(Value::String(s)) => Environment::parse(s).map(|e| Some(Some(e))).ok_or_else(|| {
+            invalid("environment must be development, testing, staging, production or none.")
+        }),
+        Some(_) => Err(invalid("environment must be a string.")),
+    }
 }
 
 struct ConnectionChange {
@@ -2395,6 +2457,7 @@ struct ConnectionChange {
     uri: Option<String>,
     username: Option<String>,
     had_password: bool,
+    environment: Option<Option<Environment>>,
 }
 
 fn connection_change_args(args: &Value) -> AppResult<ConnectionChange> {
@@ -2406,14 +2469,16 @@ fn connection_change_args(args: &Value) -> AppResult<ConnectionChange> {
         }
         None => (None, None, false),
     };
-    if name.is_none() && uri.is_none() {
-        return Err(invalid("Pass a new name, a new uri, or both."));
+    let environment = environment_arg(args)?;
+    if name.is_none() && uri.is_none() && environment.is_none() {
+        return Err(invalid("Pass a new name, uri or environment."));
     }
     Ok(ConnectionChange {
         name,
         uri,
         username,
         had_password,
+        environment,
     })
 }
 
@@ -2442,6 +2507,7 @@ fn create_connection(call: &Call<'_>, args: &Value) -> AppResult<Done> {
         id: String::new(),
         name: new.name.clone(),
         color: None,
+        environment: new.environment,
         source: ConnectionSource::Uri { uri: new.uri },
         database: None,
         username: new.username.clone(),
@@ -2511,6 +2577,10 @@ async fn update_connection(call: &Call<'_>, args: &Value) -> AppResult<Done> {
     let mut notes = Vec::new();
     if let Some(name) = &change.name {
         profile.name = name.clone();
+    }
+    check_environment_change(profile.environment, change.environment)?;
+    if let Some(environment) = change.environment {
+        profile.environment = environment;
     }
     if let Some(uri) = change.uri {
         profile.source = ConnectionSource::Uri { uri };
@@ -2717,6 +2787,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: uri.to_string(),
             },
@@ -2742,6 +2813,7 @@ mod tests {
                 .collect(),
             always: HashMap::new(),
             alerts: Default::default(),
+            confirm_production: true,
         }
     }
 
@@ -3255,6 +3327,77 @@ mod tests {
         assert!(out.text.starts_with("Lost the connection"), "{}", out.text);
     }
 
+    /// A change on a production connection is asked about even when
+    /// allowed, "always" isn't kept, and a client can't take the
+    /// connection out of production.
+    #[tokio::test]
+    async fn production_connections_ask_before_every_change() {
+        let (host, inner) = inner(Duration::from_secs(5));
+        let mut prod = profile("p1", "Billing", "mongodb://db.example:27017");
+        prod.environment = Some(Environment::Production);
+        host.state.connection_store.upsert(prod).unwrap();
+        set_policy(
+            &inner,
+            config(
+                &[("connEdit", Policy::Allow), ("connList", Policy::Allow)],
+                &[("p1", Level::Write)],
+            ),
+        );
+        let out = run(&inner, "list_connections", json!({})).await;
+        assert!(
+            out.text.contains("\"environment\":\"production\""),
+            "{}",
+            out.text
+        );
+
+        let waiting = {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run(
+                    &inner,
+                    "update_connection",
+                    json!({ "connection_id": "p1", "name": "Billing EU" }),
+                )
+                .await
+            })
+        };
+        let request = loop {
+            if let Some(event) = host.events_named(REQUEST_EVENT).pop() {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(request["production"], true);
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            super::super::RequestChoice::Always,
+        )
+        .unwrap();
+        let out = waiting.await.unwrap();
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(last_activity(&host)["label"], "Approved by you");
+        assert!(inner.config().always.is_empty());
+
+        // A client can't unmark it: refused before the user is asked.
+        let out = run(
+            &inner,
+            "update_connection",
+            json!({ "connection_id": "p1", "environment": "development" }),
+        )
+        .await;
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        assert!(
+            out.is_error && out.text.contains("only the user can change that"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            host.state.connection_store.get("p1").unwrap().environment,
+            Some(Environment::Production)
+        );
+    }
+
     #[tokio::test]
     async fn save_script_approved_writes_the_file() {
         let (host, inner) = inner(Duration::from_secs(5));
@@ -3342,6 +3485,7 @@ mod live_tests {
                 connections: HashMap::from([("live".to_string(), Level::Write)]),
                 always: HashMap::new(),
                 alerts: Default::default(),
+                confirm_production: true,
             },
         );
         (host, inner)

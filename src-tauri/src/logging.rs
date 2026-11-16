@@ -415,6 +415,7 @@ mod tests {
             id: "id".to_string(),
             name: "prod".to_string(),
             color: None,
+            environment: None,
             source,
             database: None,
             username: None,

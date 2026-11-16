@@ -121,6 +121,7 @@ async fn materialize_profile(
         id,
         name: input.name,
         color: input.color,
+        environment: input.environment,
         source,
         database: input.database,
         username,
@@ -344,6 +345,7 @@ async fn import_file(
             id: None,
             name: entry.name,
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: entry.uri },
             database: None,
             username: entry.username,
@@ -1262,6 +1264,7 @@ mod tests {
             id,
             name: name.to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200"
                     .to_string(),

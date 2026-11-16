@@ -53,11 +53,22 @@ export interface ConnectionAdvancedOptions {
   legacyUuid: LegacyUuidEncoding | null;
 }
 
+/** What a connection is for; production makes MCP clients ask before every change. */
+export type ConnectionEnvironment = "development" | "testing" | "staging" | "production";
+
+export const ENVIRONMENT_LABELS: Record<ConnectionEnvironment, { name: string; short: string }> = {
+  development: { name: "Development", short: "DEV" },
+  testing: { name: "Testing", short: "TEST" },
+  staging: { name: "Staging", short: "STG" },
+  production: { name: "Production", short: "PROD" },
+};
+
 export interface ConnectionProfile {
   id: string;
   name: string;
   /** Identity color from CONNECTION_COLORS; null picks one from the id. */
   color?: string | null;
+  environment?: ConnectionEnvironment | null;
   source: ConnectionSource;
   database: string | null;
   username: string | null;
@@ -73,6 +84,7 @@ export interface ConnectionProfileInput {
   id?: string | null;
   name: string;
   color?: string | null;
+  environment?: ConnectionEnvironment | null;
   source: ConnectionSource;
   database: string | null;
   username: string | null;
@@ -89,6 +101,7 @@ export interface ConnectionProfileMeta {
   id: string;
   name: string;
   color?: string | null;
+  environment?: ConnectionEnvironment | null;
   summary: string;
   database: string | null;
   /** Whether a password is saved for it. */
@@ -194,6 +207,7 @@ export function newProfileInput(): ConnectionProfileInput {
     id: null,
     name: "",
     color: null,
+    environment: null,
     source: { kind: "uri", uri: "" },
     database: null,
     username: null,
@@ -216,6 +230,7 @@ export function profileToInput(profile: ConnectionProfile): ConnectionProfileInp
     id: profile.id,
     name: profile.name,
     color: profile.color ?? null,
+    environment: profile.environment ?? null,
     source: profile.source,
     database: profile.database,
     username: profile.username,

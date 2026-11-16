@@ -538,6 +538,13 @@ export function McpSettings() {
           </RowGroup>
         ))}
 
+        <SwitchField
+          label="Always ask before changes on production"
+          description="On connections whose environment is Production, every write, schema change and script waits for you, even where it's set to Allow; Always allow isn't offered there."
+          checked={mcp.confirmProduction ?? true}
+          onCheckedChange={(confirmProduction) => setMcp({ confirmProduction })}
+        />
+
         <SectionTitle>When a request waits for you</SectionTitle>
         <RequestAlerts />
 

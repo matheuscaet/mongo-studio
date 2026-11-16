@@ -2,6 +2,7 @@ import { Bot, Check, CircleCheck, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { ConnectionChip } from "@/components/ui/ConnectionChip";
+import { EnvironmentTag } from "@/components/ui/EnvironmentTag";
 import { connectionColor } from "@/lib/connectionColor";
 import { useConnectionsStore } from "../../store/connectionsStore";
 import { useMcpStore } from "../../store/mcpStore";
@@ -78,7 +79,15 @@ export function McpRequestCard() {
               <ConnectionChip name={profile.name} color={connectionColor(profile.id, profile.color)} size="dot" />
             </span>
           )}
-          {request.connectionName}. {POLICY_NAME[request.capability]} is set to Ask.
+          {request.connectionName}.{" "}
+          {request.production ? (
+            <>
+              <EnvironmentTag environment="production" className="mx-0.5 align-[1px]" /> Changes on production are
+              always asked about.
+            </>
+          ) : (
+            <>{POLICY_NAME[request.capability]} is set to Ask.</>
+          )}
         </span>
       </div>
       <pre className="m-0 max-h-[220px] overflow-auto border-b border-line-soft bg-editor px-2.5 py-2 font-mono text-xs leading-[18px] whitespace-pre text-fg [font-variant-ligatures:none]">
@@ -96,14 +105,16 @@ export function McpRequestCard() {
         <Button size="sm" variant="ghost" onClick={() => void respond("deny")}>
           Deny
         </Button>
-        <Button
-          size="sm"
-          title={`Set ${POLICY_NAME[request.capability].toLowerCase()}${request.connectionName ? ` on ${request.connectionName}` : ""} to Allow`}
-          onClick={() => void respond("always")}
-          aria-label={request.connectionId ? "Always allow here" : "Always allow"}
-        >
-          {request.connectionId ? "Always allow here" : "Always allow"}
-        </Button>
+        {!request.production && (
+          <Button
+            size="sm"
+            title={`Set ${POLICY_NAME[request.capability].toLowerCase()}${request.connectionName ? ` on ${request.connectionName}` : ""} to Allow`}
+            onClick={() => void respond("always")}
+            aria-label={request.connectionId ? "Always allow here" : "Always allow"}
+          >
+            {request.connectionId ? "Always allow here" : "Always allow"}
+          </Button>
+        )}
         <Button size="sm" variant="primary" onClick={() => void respond("once")}>
           <Check />
           Allow once

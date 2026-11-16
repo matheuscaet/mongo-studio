@@ -9,6 +9,7 @@ import type { ConnectionProfileMeta } from "../../types/connection";
 import { RowContextMenu } from "@/components/common/ActionMenu";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConnectionChip } from "@/components/ui/ConnectionChip";
+import { EnvironmentTag } from "@/components/ui/EnvironmentTag";
 import { connectionColor } from "@/lib/connectionColor";
 import { ConnectionStatus } from "./ConnectionStatus";
 import { DatabaseRow } from "./DatabaseRow";
@@ -119,7 +120,12 @@ export function ConnectionRow({
             </>
           }
           labelClassName="font-medium"
-          label={<Highlighted name={profile.name} query={query} />}
+          label={
+            <>
+              <Highlighted name={profile.name} query={query} />
+              <EnvironmentTag environment={profile.environment} className="ml-1.5 align-[1px]" />
+            </>
+          }
           trailing={
             <>
               <ConnectionStatus
