@@ -1,17 +1,24 @@
+//! The built-in script engine: JavaScript on QuickJS with a mongosh-like
+//! shell (`prelude.js`) whose calls to MongoDB go through one native,
+//! `__native(op, db, coll, args)` (`ops`). Used by the console and by the
+//! MCP server's run_script.
+
+mod ops;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mongodb::bson::Bson;
 use mongodb::Client;
-use rquickjs::function::{Async, Rest};
+use rquickjs::function::{Async, Opt};
 use rquickjs::{Array, AsyncContext, AsyncRuntime, Ctx, Function, Object, Type, Value};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-use crate::driver;
 use crate::error::{AppError, AppResult};
-use crate::models::FindQueryInput;
 use crate::state::CancelToken;
 
 /// Scripts run until they finish or this timeout elapses, whichever comes
@@ -19,68 +26,61 @@ use crate::state::CancelToken;
 /// `while(true){}` hang the app indefinitely.
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
-/// The script's globals. `db` is a database handle built by `__makeDb`;
-/// `use <name>` lines become `db = __use("<name>")` (see `rewrite_use`),
-/// which also records the name in `__currentDb` for the caller to read.
-const PRELUDE: &str = r#"
-globalThis.__makeDb = function(dbName) {
-    const getCollection = function(name) {
-        return {
-            find: function(filter, options) {
-                return __native_find(dbName, name, filter || {}, options || {});
-            },
-            findOne: function(filter) {
-                return __native_find_one(dbName, name, filter || {});
-            },
-            insertOne: function(doc) {
-                return __native_insert_one(dbName, name, doc);
-            },
-            insertMany: function(docs) {
-                return __native_insert_many(dbName, name, docs);
-            },
-            updateOne: function(filter, update) {
-                return __native_update_one(dbName, name, filter, update);
-            },
-            updateMany: function(filter, update) {
-                return __native_update_many(dbName, name, filter, update);
-            },
-            deleteOne: function(filter) {
-                return __native_delete_one(dbName, name, filter);
-            },
-            deleteMany: function(filter) {
-                return __native_delete_many(dbName, name, filter);
-            },
-            aggregate: function(pipeline) {
-                return __native_aggregate(dbName, name, pipeline || []);
-            },
-            countDocuments: function(filter) {
-                return __native_count(dbName, name, filter || {});
-            },
-        };
-    };
-    return {
-        getName: function() { return dbName; },
-        getSiblingDB: function(name) { return __makeDb(__dbName(name)); },
-        getCollection: getCollection,
-        collection: getCollection,
-    };
-};
-globalThis.__dbName = function(name) {
-    if (typeof name !== "string" || name === "" || /[\/\\. "$\0]/.test(name)) {
-        throw "Invalid database name: " + JSON.stringify(name);
+const PRELUDE: &str = include_str!("prelude.js");
+
+/// What a script may do to the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptMode {
+    #[default]
+    Normal,
+    /// Every write is refused, and stops the script.
+    ReadOnly,
+    /// Writes aren't made: the engine counts what each would touch and
+    /// hands the script a made-up result.
+    DryRun,
+}
+
+/// What a run changed, as the server reported it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteTally {
+    pub inserted: u64,
+    pub matched: u64,
+    pub modified: u64,
+    pub upserted: u64,
+    pub deleted: u64,
+    /// Other changes: `createIndex on shop.users`...
+    pub other: Vec<String>,
+}
+
+impl WriteTally {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
-    return name;
-};
-globalThis.__use = function(name) {
-    globalThis.__currentDb = __dbName(name);
-    console.log("switched to db " + name);
-    return __makeDb(name);
-};
-globalThis.db = __makeDb(globalThis.__currentDb);
-globalThis.print = function(...args) { console.log(...args); };
-globalThis.ObjectId = function(hex) { return { $oid: hex }; };
-globalThis.ISODate = function(str) { return { $date: str }; };
-"#;
+
+    /// `3 inserted, 12 modified` or `nothing`.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = [
+            (self.inserted, "inserted"),
+            (self.modified, "modified"),
+            (self.upserted, "upserted"),
+            (self.deleted, "deleted"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+        if self.matched > self.modified && parts.iter().any(|p| p.ends_with("modified")) {
+            parts.push(format!("{} matched", self.matched));
+        }
+        parts.extend(self.other.iter().cloned());
+        if parts.is_empty() {
+            "nothing".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ScriptExecutionResult {
@@ -89,6 +89,10 @@ pub struct ScriptExecutionResult {
     /// The database `db` pointed at when the script ended: the one it
     /// started on, unless a `use` line switched it.
     pub database: String,
+    /// What the writes changed.
+    pub writes: WriteTally,
+    /// A dry run's writes, one line each: what each would have touched.
+    pub planned: Vec<String>,
 }
 
 /// Runs `script` against `database` on a dedicated OS thread so the
@@ -107,6 +111,28 @@ pub async fn run_script(
     cancel: CancelToken,
     on_log: impl Fn(String) + Send + 'static,
 ) -> AppResult<ScriptExecutionResult> {
+    run_script_in(
+        client,
+        database,
+        script,
+        timeout_ms,
+        ScriptMode::Normal,
+        cancel,
+        on_log,
+    )
+    .await
+}
+
+/// `run_script` in a given mode.
+pub async fn run_script_in(
+    client: Client,
+    database: String,
+    script: String,
+    timeout_ms: Option<u64>,
+    mode: ScriptMode,
+    cancel: CancelToken,
+    on_log: impl Fn(String) + Send + 'static,
+) -> AppResult<ScriptExecutionResult> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     // The timeout stops runaway JavaScript; unlike Cancel it doesn't cut a
     // query short, so a long aggregation can still finish.
@@ -120,7 +146,9 @@ pub async fn run_script(
     let handle = tokio::runtime::Handle::current();
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let outcome = handle.block_on(execute(client, database, script, cancel, timed_out, on_log));
+        let outcome = handle.block_on(execute(
+            client, database, script, mode, cancel, timed_out, on_log,
+        ));
         let _ = tx.send(outcome);
     });
 
@@ -135,6 +163,7 @@ async fn execute(
     client: Client,
     database: String,
     script: String,
+    mode: ScriptMode,
     cancel: CancelToken,
     timed_out: Arc<AtomicBool>,
     on_log: impl Fn(String) + Send + 'static,
@@ -151,11 +180,19 @@ async fn execute(
         .map_err(|e| AppError::InvalidInput(e.to_string()))?;
 
     let logs = Rc::new(RefCell::new(Vec::<String>::new()));
+    let engine = Rc::new(ops::Engine::new(client, mode));
 
     let outcome: Result<(JsonValue, String), String> = ctx
         .async_with(async |ctx| {
-            install_globals(&ctx, client, database, cancel.clone(), logs.clone(), on_log)
-                .map_err(|e| describe_js_error(&ctx, e))?;
+            install_globals(
+                &ctx,
+                engine.clone(),
+                database,
+                cancel.clone(),
+                logs.clone(),
+                on_log,
+            )
+            .map_err(|e| describe_js_error(&ctx, e))?;
             let promise = ctx
                 .eval_promise(rewrite_use(&script))
                 .map_err(|e| describe_js_error(&ctx, e))?;
@@ -173,12 +210,25 @@ async fn execute(
                 }
                 _ => value,
             };
-            let value = js_to_json(&unwrapped).map_err(|e| describe_js_error(&ctx, e))?;
+            // A cursor left as the last expression is read, as mongosh
+            // would print it; dates and ids become Extended JSON.
+            let finish: Function = ctx
+                .globals()
+                .get("__finish")
+                .map_err(|e| describe_js_error(&ctx, e))?;
+            let finished: rquickjs::Promise = finish
+                .call((unwrapped,))
+                .map_err(|e| describe_js_error(&ctx, e))?;
+            let finished: Value = finished
+                .into_future()
+                .await
+                .map_err(|e| describe_js_error(&ctx, e))?;
+            let value = js_to_json(&finished).map_err(|e| describe_js_error(&ctx, e))?;
             let database: String = ctx
                 .globals()
                 .get("__currentDb")
                 .map_err(|e| describe_js_error(&ctx, e))?;
-            Ok((value, database))
+            Ok((relaxed(value), database))
         })
         .await;
 
@@ -187,8 +237,19 @@ async fn execute(
             value,
             logs: logs.borrow().clone(),
             database,
+            writes: engine.tally.borrow().clone(),
+            planned: engine.planned.borrow().clone(),
         }),
         Err(message) => Err(AppError::InvalidInput(message)),
+    }
+}
+
+/// Extended JSON as the app shows it (relaxed: plain numbers, ISO dates);
+/// a value that isn't Extended JSON stays as it is.
+fn relaxed(value: JsonValue) -> JsonValue {
+    match Bson::try_from(value.clone()) {
+        Ok(bson) => bson.into_relaxed_extjson(),
+        Err(_) => value,
     }
 }
 
@@ -255,145 +316,60 @@ fn app_err_to_js<'js>(ctx: &Ctx<'js>, err: AppError) -> rquickjs::Error {
 
 fn install_globals<'js>(
     ctx: &Ctx<'js>,
-    client: Client,
+    engine: Rc<ops::Engine>,
     database: String,
     cancel: CancelToken,
     logs: Rc<RefCell<Vec<String>>>,
     on_log: impl Fn(String) + 'js,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
-
-    let console = Object::new(ctx.clone())?;
-    let logs_for_log = logs.clone();
-    console.set(
-        "log",
-        Function::new(ctx.clone(), move |args: Rest<Value<'_>>| {
-            let message = args
-                .0
-                .iter()
-                .map(format_js_value)
-                .collect::<Vec<_>>()
-                .join(" ");
-            logs_for_log.borrow_mut().push(message.clone());
-            on_log(message);
+    globals.set(
+        "__log",
+        Function::new(ctx.clone(), move |line: String| {
+            logs.borrow_mut().push(line.clone());
+            on_log(line);
         }),
     )?;
-    globals.set("console", console)?;
+    globals.set(
+        "__format",
+        Function::new(
+            ctx.clone(),
+            move |value: Value<'js>, pretty: Opt<bool>| -> rquickjs::Result<String> {
+                let json = relaxed(js_to_json(&value)?);
+                Ok(if pretty.0.unwrap_or(false) {
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                } else {
+                    json.to_string()
+                })
+            },
+        ),
+    )?;
+    globals.set(
+        "__new_object_id",
+        Function::new(ctx.clone(), || mongodb::bson::oid::ObjectId::new().to_hex()),
+    )?;
+    globals.set(
+        "__new_uuid",
+        Function::new(ctx.clone(), || uuid::Uuid::new_v4().to_string()),
+    )?;
     // where `db` starts; `use` moves it
     globals.set("__currentDb", database)?;
-
-    let find_client = client.clone();
-
-    let find_cancel = cancel.clone();
     globals.set(
-        "__native_find",
+        "__native",
         Function::new(
             ctx.clone(),
             Async(
-                move |ctx: Ctx<'js>,
-                      database: String,
-                      coll: String,
-                      filter: Value<'js>,
-                      options: Value<'js>| {
-                    let client = find_client.clone();
-                    let cancel = find_cancel.clone();
+                move |ctx: Ctx<'js>, op: String, db: String, coll: String, args: Value<'js>| {
+                    let engine = engine.clone();
+                    let cancel = cancel.clone();
                     async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let options_json =
-                            js_to_json(&options).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let query = find_query_from_json(filter_json, options_json)
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        let page = cancel
-                            .guard(driver::run_find(&client, &database, &coll, &query))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &JsonValue::Array(page.documents))
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let find_one_client = client.clone();
-
-    let find_one_cancel = cancel.clone();
-    globals.set(
-        "__native_find_one",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, filter: Value<'js>| {
-                    let client = find_one_client.clone();
-                    let cancel = find_one_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let query = FindQueryInput {
-                            filter: filter_json,
-                            sort: None,
-                            projection: None,
-                            limit: Some(1),
-                            skip: None,
+                        let args = match js_to_json(&args) {
+                            Ok(JsonValue::Array(args)) => args,
+                            Ok(_) => Vec::new(),
+                            Err(e) => return Err(app_err_to_js(&ctx, invalid(e))),
                         };
-                        let page = cancel
-                            .guard(driver::run_find(&client, &database, &coll, &query))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        let first = page.documents.into_iter().next().unwrap_or(JsonValue::Null);
-                        json_to_js(&ctx, &first)
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let insert_client = client.clone();
-
-    let insert_cancel = cancel.clone();
-    globals.set(
-        "__native_insert_one",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, document: Value<'js>| {
-                    let client = insert_client.clone();
-                    let cancel = insert_cancel.clone();
-                    async move {
-                        let document_json =
-                            js_to_json(&document).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
                         let result = cancel
-                            .guard(driver::insert_one(&client, &database, &coll, document_json))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &serde_json::json!({ "insertedId": result }))
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let insert_many_client = client.clone();
-
-    let insert_many_cancel = cancel.clone();
-    globals.set(
-        "__native_insert_many",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, documents: Value<'js>| {
-                    let client = insert_many_client.clone();
-                    let cancel = insert_many_cancel.clone();
-                    async move {
-                        let documents_json =
-                            js_to_json(&documents).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let result = cancel
-                            .guard(driver::insert_many(
-                                &client,
-                                &database,
-                                &coll,
-                                documents_json,
-                            ))
+                            .guard(ops::dispatch(&engine, &op, &db, &coll, args))
                             .await
                             .map_err(|e| app_err_to_js(&ctx, e))?;
                         json_to_js(&ctx, &result)
@@ -402,191 +378,6 @@ fn install_globals<'js>(
             ),
         )?,
     )?;
-
-    let update_client = client.clone();
-
-    let update_cancel = cancel.clone();
-    globals.set(
-        "__native_update_one",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>,
-                      database: String,
-                      coll: String,
-                      filter: Value<'js>,
-                      update: Value<'js>| {
-                    let client = update_client.clone();
-                    let cancel = update_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let update_json =
-                            js_to_json(&update).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let result = cancel
-                            .guard(driver::update_one(
-                                &client,
-                                &database,
-                                &coll,
-                                filter_json,
-                                update_json,
-                            ))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &result)
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let update_many_client = client.clone();
-
-    let update_many_cancel = cancel.clone();
-    globals.set(
-        "__native_update_many",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>,
-                      database: String,
-                      coll: String,
-                      filter: Value<'js>,
-                      update: Value<'js>| {
-                    let client = update_many_client.clone();
-                    let cancel = update_many_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let update_json =
-                            js_to_json(&update).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let result = cancel
-                            .guard(driver::update_many(
-                                &client,
-                                &database,
-                                &coll,
-                                filter_json,
-                                update_json,
-                            ))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &result)
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let delete_client = client.clone();
-
-    let delete_cancel = cancel.clone();
-    globals.set(
-        "__native_delete_one",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, filter: Value<'js>| {
-                    let client = delete_client.clone();
-                    let cancel = delete_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let result = cancel
-                            .guard(driver::delete_one(&client, &database, &coll, filter_json))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &result)
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let delete_many_client = client.clone();
-
-    let delete_many_cancel = cancel.clone();
-    globals.set(
-        "__native_delete_many",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, filter: Value<'js>| {
-                    let client = delete_many_client.clone();
-                    let cancel = delete_many_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let result = cancel
-                            .guard(driver::delete_many(&client, &database, &coll, filter_json))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &result)
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let aggregate_client = client.clone();
-
-    let aggregate_cancel = cancel.clone();
-    globals.set(
-        "__native_aggregate",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, pipeline: Value<'js>| {
-                    let client = aggregate_client.clone();
-                    let cancel = aggregate_cancel.clone();
-                    async move {
-                        let pipeline_json =
-                            js_to_json(&pipeline).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let page = cancel
-                            .guard(driver::run_aggregate(
-                                &client,
-                                &database,
-                                &coll,
-                                pipeline_json,
-                            ))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &JsonValue::Array(page.documents))
-                    }
-                },
-            ),
-        )?,
-    )?;
-
-    let count_client = client.clone();
-
-    let count_cancel = cancel.clone();
-    globals.set(
-        "__native_count",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |ctx: Ctx<'js>, database: String, coll: String, filter: Value<'js>| {
-                    let client = count_client.clone();
-                    let cancel = count_cancel.clone();
-                    async move {
-                        let filter_json =
-                            js_to_json(&filter).map_err(|e| app_err_to_js(&ctx, invalid(e)))?;
-                        let count = cancel
-                            .guard(driver::count_documents(
-                                &client,
-                                &database,
-                                &coll,
-                                filter_json,
-                            ))
-                            .await
-                            .map_err(|e| app_err_to_js(&ctx, e))?;
-                        json_to_js(&ctx, &JsonValue::from(count))
-                    }
-                },
-            ),
-        )?,
-    )?;
-
     ctx.eval_promise(PRELUDE)?;
     Ok(())
 }
@@ -595,30 +386,9 @@ fn invalid(err: rquickjs::Error) -> AppError {
     AppError::InvalidInput(err.to_string())
 }
 
-fn find_query_from_json(filter: JsonValue, options: JsonValue) -> AppResult<FindQueryInput> {
-    let obj = options.as_object();
-    Ok(FindQueryInput {
-        filter,
-        sort: obj.and_then(|o| o.get("sort")).cloned(),
-        projection: obj.and_then(|o| o.get("projection")).cloned(),
-        limit: obj
-            .and_then(|o| o.get("limit"))
-            .and_then(|v| v.as_i64())
-            .or(Some(1000)),
-        skip: obj.and_then(|o| o.get("skip")).and_then(|v| v.as_u64()),
-    })
-}
-
-fn format_js_value(value: &Value<'_>) -> String {
-    if let Some(s) = value.as_string() {
-        return s.to_string().unwrap_or_default();
-    }
-    match js_to_json(value) {
-        Ok(json) => serde_json::to_string(&json).unwrap_or_else(|_| "null".to_string()),
-        Err(_) => "<unrepresentable value>".to_string(),
-    }
-}
-
+/// A plain JS value as JSON. Objects keep their own enumerable properties;
+/// the prelude has already turned dates, ids and the like into Extended
+/// JSON.
 fn js_to_json(value: &Value<'_>) -> rquickjs::Result<JsonValue> {
     match value.type_of() {
         Type::Uninitialized | Type::Undefined | Type::Null => Ok(JsonValue::Null),
@@ -892,6 +662,221 @@ mod live_tests {
         assert_eq!(value["updated"]["upsertedId"], JsonValue::Null);
         assert_eq!(value["deleted"]["deletedCount"], 2);
         assert_eq!(value["left"], 1);
+    }
+
+    async fn run_in(
+        client: &Client,
+        script: &str,
+        mode: ScriptMode,
+    ) -> AppResult<ScriptExecutionResult> {
+        run_script_in(
+            client.clone(),
+            "mongo_studio_test".to_string(),
+            script.to_string(),
+            Some(20_000),
+            mode,
+            CancelToken::default(),
+            noop_log(),
+        )
+        .await
+    }
+
+    /// Dates, ids, longs, regexes and UUIDs reach the server as BSON types
+    /// and come back as the same JS types.
+    #[tokio::test]
+    #[ignore]
+    async fn live_script_bson_types_round_trip() {
+        let (client, _) = live_client().await;
+        let coll = format!("script_types_{}", uuid::Uuid::new_v4().simple());
+        let script = format!(
+            r#"
+            const c = db["{coll}"];
+            const when = new Date("2026-03-04T05:06:07.000Z");
+            await c.insertOne({{ _id: 1, when, at: ISODate("2026-01-01"), n: NumberLong("9007199254740993"),
+                                 i: NumberInt(7), d: NumberDecimal("1.10"), u: UUID("0123456789abcdef0123456789abcdef"),
+                                 name: "Ana" }});
+            const doc = await c.findOne({{ when: {{ $gte: new Date("2026-01-01") }}, name: /^an/i }});
+            const types = await c.aggregate([{{ $project: {{ when: {{ $type: "$when" }}, n: {{ $type: "$n" }}, i: {{ $type: "$i" }}, d: {{ $type: "$d" }}, u: {{ $type: "$u" }} }} }}]).toArray();
+            ({{ isDate: doc.when instanceof Date, ms: doc.when.getTime(), long: doc.n.toString(), u: doc.u.toString(), types: types[0], doc }})
+            "#
+        );
+        let result = run_in(&client, &script, ScriptMode::Normal).await;
+        client
+            .database("mongo_studio_test")
+            .collection::<mongodb::bson::Document>(&coll)
+            .drop()
+            .await
+            .unwrap();
+        let value = result.unwrap().value;
+        assert_eq!(value["isDate"], true, "{value}");
+        // a JS number past 32 bits is a double, as in mongosh
+        assert_eq!(value["ms"].as_f64(), Some(1772600767000.0), "{value}");
+        assert_eq!(value["long"], "9007199254740993");
+        assert_eq!(value["u"], "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(value["types"]["when"], "date", "{value}");
+        assert_eq!(value["types"]["n"], "long");
+        assert_eq!(value["types"]["i"], "int");
+        assert_eq!(value["types"]["d"], "decimal");
+        assert_eq!(value["types"]["u"], "binData");
+        // shown as relaxed Extended JSON, like before
+        assert_eq!(
+            value["doc"]["when"]["$date"], "2026-03-04T05:06:07Z",
+            "{value}"
+        );
+    }
+
+    /// mongosh's shapes: db.coll, chained cursors, toArray, forEach,
+    /// distinct, bulkWrite, upsert options, getName.
+    #[tokio::test]
+    #[ignore]
+    async fn live_script_speaks_more_mongosh() {
+        let (client, _) = live_client().await;
+        let coll = format!("script_shell_{}", uuid::Uuid::new_v4().simple());
+        let script = format!(
+            r#"
+            const c = db.{coll};
+            await c.insertMany(Array.from({{ length: 1200 }}, (_, i) => ({{ i, kind: i % 3 ? "a" : "b" }})));
+            const top = await c.find({{ kind: "a" }}, {{ _id: 0, i: 1 }}).sort({{ i: -1 }}).limit(2).toArray();
+            let seen = 0;
+            await c.find().forEach(() => {{ seen++; }});
+            const all = (await c.find().toArray()).length;
+            const bare = (await c.find()).length;
+            const kinds = await c.distinct("kind");
+            const up = await c.updateOne({{ key: "x" }}, {{ $setOnInsert: {{ made: true }} }}, {{ upsert: true }});
+            const bulk = await c.bulkWrite([
+              {{ insertOne: {{ document: {{ i: -1 }} }} }},
+              {{ updateMany: {{ filter: {{ kind: "b" }}, update: {{ $set: {{ flagged: true }} }} }} }},
+              {{ updateOne: {{ filter: {{ key: "y" }}, update: {{ $set: {{ v: 1 }} }}, upsert: true }} }},
+              {{ deleteOne: {{ filter: {{ i: 0 }} }} }},
+            ]);
+            let bad = null;
+            try {{ await c.updateOne({{}}, {{ $set: {{ a: 1 }} }}, {{ multi: true }}); }} catch (e) {{ bad = String(e); }}
+            const n = await c.countDocuments({{}}, {{ maxTimeMS: 5000, hint: {{ _id: 1 }} }});
+            const plain = typeof n === "number" && n === 1202 && typeof (await c.estimatedDocumentCount()) === "number";
+            ({{ top, seen, all, bare, kinds, up, bulk, bad, n, plain, name: db.getName(), full: c.getFullName() }})
+            "#
+        );
+        let result = run_in(&client, &script, ScriptMode::Normal).await;
+        client
+            .database("mongo_studio_test")
+            .collection::<mongodb::bson::Document>(&coll)
+            .drop()
+            .await
+            .unwrap();
+        let result = result.unwrap();
+        let value = result.value;
+        assert_eq!(
+            value["top"],
+            serde_json::json!([{ "i": 1199 }, { "i": 1198 }]),
+            "{value}"
+        );
+        assert_eq!(value["seen"], 1200);
+        assert_eq!(value["all"], 1200);
+        assert_eq!(value["bare"], 1000);
+        assert!(
+            result
+                .logs
+                .iter()
+                .any(|l| l.contains("showing the first 1000")),
+            "{:?}",
+            result.logs
+        );
+        assert_eq!(value["kinds"], serde_json::json!(["a", "b"]));
+        assert_eq!(value["up"]["upsertedCount"], 1, "{value}");
+        assert_eq!(value["bulk"]["insertedCount"], 1, "{value}");
+        assert_eq!(value["bulk"]["modifiedCount"], 400, "{value}");
+        assert_eq!(value["bulk"]["upsertedCount"], 1, "{value}");
+        assert_eq!(value["bulk"]["deletedCount"], 1, "{value}");
+        assert!(
+            value["bad"].as_str().unwrap().contains("\"multi\""),
+            "{value}"
+        );
+        assert_eq!(value["n"], 1202, "{value}");
+        assert_eq!(value["plain"], true, "counts are plain numbers: {value}");
+        assert_eq!(value["name"], "mongo_studio_test");
+        assert_eq!(result.writes.inserted, 1201, "{:?}", result.writes);
+        assert_eq!(result.writes.upserted, 2, "{:?}", result.writes);
+        assert_eq!(result.writes.deleted, 1, "{:?}", result.writes);
+    }
+
+    /// Read-only refuses writes; a dry run counts them without making them.
+    #[tokio::test]
+    #[ignore]
+    async fn live_script_read_only_and_dry_run() {
+        let (client, _) = live_client().await;
+        let coll = format!("script_modes_{}", uuid::Uuid::new_v4().simple());
+        run_in(
+            &client,
+            &format!("await db.{coll}.insertMany([{{s: 1}}, {{s: 1}}, {{s: 2}}])"),
+            ScriptMode::Normal,
+        )
+        .await
+        .unwrap();
+        let read = run_in(
+            &client,
+            &format!("await db.{coll}.countDocuments({{ s: 1 }})"),
+            ScriptMode::ReadOnly,
+        )
+        .await;
+        let refused = run_in(
+            &client,
+            &format!("print('before'); await db.{coll}.deleteMany({{}})"),
+            ScriptMode::ReadOnly,
+        )
+        .await;
+        let out = run_in(
+            &client,
+            &format!("await db.{coll}.aggregate([{{ $match: {{}} }}, {{ $out: 'copy_{coll}' }}]).toArray()"),
+            ScriptMode::ReadOnly,
+        )
+        .await;
+        let dry = run_in(
+            &client,
+            &format!(
+                "const r = await db.{coll}.updateMany({{ s: 1 }}, {{ $set: {{ t: 1 }} }}); \
+                 await db.{coll}.insertOne({{ s: 3 }}); await db.{coll}.deleteOne({{ s: 2 }}); \
+                 await db.{coll}.createIndex({{ s: 1 }}); r.matchedCount"
+            ),
+            ScriptMode::DryRun,
+        )
+        .await;
+        let left = run_in(
+            &client,
+            &format!(
+                "await db.{coll}.countDocuments({{ t: 1 }}) + await db.{coll}.countDocuments({{}})"
+            ),
+            ScriptMode::Normal,
+        )
+        .await;
+        client
+            .database("mongo_studio_test")
+            .collection::<mongodb::bson::Document>(&coll)
+            .drop()
+            .await
+            .unwrap();
+        assert_eq!(read.unwrap().value, 2);
+        let refused = refused.unwrap_err().to_string();
+        assert!(
+            refused.contains("read-only") && refused.contains("deleteMany"),
+            "{refused}"
+        );
+        assert!(out.unwrap_err().to_string().contains("read-only"));
+        let dry = dry.unwrap();
+        assert_eq!(dry.value, 2);
+        assert!(dry.writes.is_empty(), "{:?}", dry.writes);
+        assert_eq!(dry.planned.len(), 4, "{:?}", dry.planned);
+        assert!(
+            dry.planned[0].contains("2 documents would change"),
+            "{:?}",
+            dry.planned
+        );
+        assert!(
+            dry.planned[2].contains("1 document would be deleted"),
+            "{:?}",
+            dry.planned
+        );
+        // nothing changed: no t, still 3 documents
+        assert_eq!(left.unwrap().value, 3);
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ use crate::ejson::{bson_to_json, document_to_json, json_to_document};
 use crate::error::{AppError, AppResult};
 use crate::logging::{self, Detail, Op};
 use crate::models::{ConnectionProfile, ConnectionSource};
+use crate::scripting::{ScriptExecutionResult, ScriptMode};
 use crate::state::CancelToken;
 
 /// Server-side limit on reads.
@@ -54,6 +55,9 @@ const MAX_INSERT: usize = 1000;
 const DEFAULT_SCRIPT_MS: i64 = 30_000;
 const MAX_SCRIPT_MS: i64 = 300_000;
 const DEFAULT_TASK_WAIT_MS: i64 = 30_000;
+const SCRIPT_READ_ONLY_HINT: &str = "You have read-only access to this connection in Mongo \
+Studio, and this script could write. Run it with read_only: true (writes are refused and stop \
+the script) or dry_run: true (writes are only counted).";
 /// Under the minute many clients wait for a request.
 const MAX_TASK_WAIT_MS: i64 = 45_000;
 
@@ -257,6 +261,7 @@ impl Tool {
     fn changes_data(self, args: &Value) -> bool {
         match self {
             Tool::Aggregate => aggregate_writes(args),
+            Tool::RunScript => script_mode(args) == ScriptMode::Normal,
             tool => !matches!(
                 tool.cap(),
                 Cap::Browse | Cap::Read | Cap::ConnList | Cap::RelRead
@@ -461,10 +466,12 @@ fn all_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "run_script",
-            "description": "Run JavaScript on a database with Mongo Studio's built-in engine (not full mongosh). It has db.getCollection(name) (or db.collection(name)) with find(filter, options), findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate and countDocuments - each returns a promise, so await it - plus db.getSiblingDB(name), `use <db>` lines, print/console.log, ObjectId(hex) and ISODate(text). Returns the last expression's value as Extended JSON and what the script printed. Scripts can change data, so this needs write access, and the user may have to approve it first.",
+            "description": "Run JavaScript on a database with Mongo Studio's built-in engine, which speaks most of mongosh's API with top-level await (not the full mongosh: await every call). It has db.<collection> and db.getCollection(name) with find(filter, projection, options) returning a cursor (sort, limit, skip, project, hint, maxTimeMS, allowDiskUse, collation, map, toArray, forEach, hasNext/next, for await), findOne, aggregate(pipeline, options) (a cursor too), countDocuments, estimatedDocumentCount, distinct, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne, deleteMany, findOneAndUpdate/Replace/Delete, bulkWrite, getIndexes, createIndex and drop, each taking the same options as in mongosh (an option the engine doesn't support is an error, never ignored); plus db.getName(), db.getSiblingDB(name), db.getCollectionNames(), db.runCommand(cmd), `use <db>` lines, print/printjson/console.log and `await sleep(ms)`. Dates (new Date(), ISODate()), ObjectId(), NumberLong(), NumberInt(), NumberDecimal(), UUID() and regexes are stored as their BSON types and come back as such. `await cursor` without toArray() returns at most 1000 documents. Returns the last expression's value as relaxed Extended JSON, what the script printed, and what its writes changed. A script that writes needs write access and may need the user's approval; with read_only it needs only read access and any write stops it, and with dry_run no write is made: each is counted (how many documents it would touch) and reported instead. A call that runs past about 40 seconds goes on in the background (see get_task).",
             "inputSchema": on_db(json!({
-                "script": { "type": "string", "description": "The script, e.g. const n = await db.getCollection(\"orders\").countDocuments({ status: \"open\" }); n" },
-                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS },
+                "script": { "type": "string", "description": "The script, e.g. const n = await db.orders.countDocuments({ status: \"open\" }); n" },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS, "description": "The script is stopped (and the query it waits on) after this long; writes made before stay." },
+                "read_only": { "type": "boolean", "default": false, "description": "Refuse every write: the first one stops the script. Needs only read access to the connection." },
+                "dry_run": { "type": "boolean", "default": false, "description": "Don't write anything: each write is counted and reported (how many documents it would insert, change or delete) and gets a made-up result. Reads later in the script don't see those writes. Needs only read access." },
             }), &["script"]),
             "annotations": destructive,
         }),
@@ -759,13 +766,15 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
         _ => tool.cap(),
     };
+    // A script that can't write needs only read access.
+    let script_reads = tool == Tool::RunScript && script_mode(args) != ScriptMode::Normal;
     let decide = |cap: Cap| {
-        policy::decide(
-            &config,
-            cap,
-            call.target.connection_id.as_deref(),
-            level_needed(cap),
-        )
+        let need = if script_reads {
+            Level::Read
+        } else {
+            level_needed(cap)
+        };
+        policy::decide(&config, cap, call.target.connection_id.as_deref(), need)
     };
     let (cap, decision) = match tool {
         // Joining returns documents: `read` must allow it as well.
@@ -774,7 +783,19 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
     };
     match decision {
         Decision::Off => return call.refuse("Refused: turned off", policy::REFUSED_OFF),
-        Decision::NoAccess => return call.refuse("Refused: no access", policy::REFUSED_NO_ACCESS),
+        Decision::NoAccess => {
+            let reads = call
+                .target
+                .connection_id
+                .as_deref()
+                .is_some_and(|id| policy::level_of(&config, id) == Level::Read);
+            let text = if tool == Tool::RunScript && reads {
+                SCRIPT_READ_ONLY_HINT
+            } else {
+                policy::REFUSED_NO_ACCESS
+            };
+            return call.refuse("Refused: no access", text);
+        }
         Decision::Ask | Decision::Allow | Decision::AllowAlways => {}
     }
 
@@ -923,6 +944,121 @@ fn script_timed_out(timeout_ms: u64, printed: &[String]) -> AppError {
         ));
     }
     AppError::TimedOut(text)
+}
+
+/// How run_script treats writes, from its arguments.
+fn script_mode(args: &Value) -> ScriptMode {
+    if bool_of(args, "dry_run") {
+        ScriptMode::DryRun
+    } else if bool_of(args, "read_only") {
+        ScriptMode::ReadOnly
+    } else {
+        ScriptMode::Normal
+    }
+}
+
+/// A script that ran to its end.
+struct ScriptRan {
+    result: ScriptExecutionResult,
+    mode: ScriptMode,
+}
+
+impl ScriptRan {
+    fn text(&self, db: &str) -> String {
+        let r = &self.result;
+        let mut text = match self.mode {
+            ScriptMode::DryRun => format!("Dry run on {db}: nothing was written."),
+            ScriptMode::ReadOnly => format!("The script ran read-only on {db}."),
+            ScriptMode::Normal => format!("The script ran on {db}."),
+        };
+        if r.database != db {
+            text.push_str(&format!(" (db is now {}.)", r.database));
+        }
+        match self.mode {
+            ScriptMode::DryRun if r.planned.is_empty() => text.push_str(" It made no writes."),
+            ScriptMode::DryRun => text.push_str(&format!(
+                " Its writes would have done this (later reads in the script don't see them):\n- {}",
+                r.planned.join("\n- ")
+            )),
+            _ if !r.writes.is_empty() => {
+                text.push_str(&format!("\nChanged: {}.", r.writes.summary()))
+            }
+            _ => {}
+        }
+        text.push_str(&format!(
+            "\nResult (relaxed Extended JSON):\n{}",
+            serde_json::to_string_pretty(&r.value).unwrap_or_default()
+        ));
+        if !r.logs.is_empty() {
+            text.push_str(&format!("\nPrinted:\n{}", r.logs.join("\n")));
+        }
+        text
+    }
+
+    fn meta(&self) -> String {
+        let r = &self.result;
+        let printed = plural(r.logs.len() as u64, "line", "lines");
+        match self.mode {
+            ScriptMode::DryRun => format!("dry run · {} writes · {printed}", r.planned.len()),
+            _ if !r.writes.is_empty() => format!("{} · {printed}", r.writes.summary()),
+            _ => format!("{printed} printed"),
+        }
+    }
+}
+
+/// What a run_script call came to, with what it printed either way.
+struct ScriptOutcome {
+    result: AppResult<ScriptRan>,
+}
+
+/// Runs run_script's script on one connection's `client`, within
+/// timeout_ms. `prefix` marks the lines it prints in the task's output
+/// when several connections run it.
+async fn run_script(
+    call: &Call<'_>,
+    client: &Client,
+    db: &str,
+    args: &Value,
+    prefix: Option<String>,
+) -> ScriptOutcome {
+    let script = match script_of(args) {
+        Ok(script) => script,
+        Err(e) => return ScriptOutcome { result: Err(e) },
+    };
+    let mode = script_mode(args);
+    let timeout = script_timeout(args) as u64;
+    let printed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = printed.clone();
+    let task = call.task.clone();
+    // Stops the script, and the query it waits on, when the call ends
+    // early: past timeout_ms, or dropped.
+    let stop = CancelOnDrop(CancelToken::default());
+    let run = crate::scripting::run_script_in(
+        client.clone(),
+        db.to_string(),
+        script,
+        // The engine's own limit only interrupts JavaScript; the one below
+        // also stops a query in flight.
+        Some(timeout + 5_000),
+        mode,
+        stop.0.clone(),
+        move |line: String| {
+            match &prefix {
+                Some(p) => task.print(format!("[{p}] {line}")),
+                None => task.print(line.clone()),
+            }
+            sink.lock().unwrap().push(line);
+        },
+    );
+    let result = tokio::select! {
+        result = run => result.map(|result| ScriptRan { result, mode }),
+        () = tokio::time::sleep(Duration::from_millis(timeout)) => {
+            stop.0.cancel();
+            let printed = printed.lock().unwrap();
+            Err(script_timed_out(timeout, &printed))
+        }
+    };
+    ScriptOutcome { result }
 }
 
 fn doc_of(args: &Value, key: &str) -> AppResult<Document> {
@@ -1237,7 +1373,12 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
         }
         Tool::RunScript => {
             let script = script_of(args)?;
-            plan(format!("Run a script on {db}"), code_on(db, None, &script))
+            let title = match script_mode(args) {
+                ScriptMode::Normal => format!("Run a script on {db}"),
+                ScriptMode::ReadOnly => format!("Run a read-only script on {db}"),
+                ScriptMode::DryRun => format!("Dry-run a script on {db} (nothing is written)"),
+            };
+            plan(title, code_on(db, None, &script))
         }
         Tool::CreateConnection => {
             let new = new_connection_args(args)?;
@@ -1526,49 +1667,11 @@ async fn execute(
                     })
                 }
                 Tool::RunScript => {
-                    let script = script_of(args)?;
-                    let timeout = script_timeout(args) as u64;
-                    let printed = Arc::new(Mutex::new(Vec::<String>::new()));
-                    let sink = printed.clone();
-                    let task = call.task.clone();
-                    // Stops the script, and the query it waits on, when the
-                    // call ends early: past timeout_ms, or dropped.
-                    let stop = CancelOnDrop(CancelToken::default());
-                    let run = timed!(crate::scripting::run_script(
-                        client.clone(),
-                        db.to_string(),
-                        script,
-                        // The engine's own limit only interrupts JavaScript;
-                        // the one below also stops a query in flight.
-                        Some(timeout + 5_000),
-                        stop.0.clone(),
-                        move |line: String| {
-                            task.print(line.clone());
-                            sink.lock().unwrap().push(line);
-                        },
-                    ));
-                    let result = tokio::select! {
-                        result = run => result?,
-                        () = tokio::time::sleep(Duration::from_millis(timeout)) => {
-                            stop.0.cancel();
-                            let printed = printed.lock().unwrap();
-                            return Err(script_timed_out(timeout, &printed));
-                        }
-                    };
-                    let mut text = format!(
-                        "The script ran on {db} (db is now {}).\nResult (relaxed Extended JSON):\n{}",
-                        result.database,
-                        serde_json::to_string_pretty(&result.value).unwrap_or_default()
-                    );
-                    if !result.logs.is_empty() {
-                        text.push_str(&format!("\nPrinted:\n{}", result.logs.join("\n")));
-                    }
-                    Ok(Done {
-                        text,
-                        meta: format!(
-                            "{} printed",
-                            plural(result.logs.len() as u64, "line", "lines")
-                        ),
+                    let run = run_script(call, client, db, args, None);
+                    let outcome = timed!(async { Ok(run.await) }).await?;
+                    outcome.result.map(|ran| Done {
+                        meta: ran.meta(),
+                        text: ran.text(db),
                     })
                 }
                 _ => unreachable!("handled above"),
@@ -3066,6 +3169,77 @@ mod live_tests {
         let c = client.database(TEST_DB).collection::<Document>(&coll);
         // The second run inserted, then was stopped while reading.
         assert_eq!(c.count_documents(doc! {}).await.unwrap(), 4);
+        c.drop().await.unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// On a read-only connection a script runs with read_only or dry_run;
+    /// without them it's refused with a hint.
+    #[tokio::test]
+    #[ignore]
+    async fn live_read_only_and_dry_run_scripts() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let script = |s: &str| json!({ "connection_id": "live", "database": TEST_DB, "script": s });
+        let out = run(
+            &inner,
+            "run_script",
+            script(&format!("await db.{coll}.insertMany([{{a:1}},{{a:1}}])")),
+        )
+        .await;
+        assert!(out.text.contains("Changed: 2 inserted"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::Read);
+
+        let write = format!("await db.{coll}.updateMany({{a:1}}, {{$set: {{b: new Date()}}}})");
+        let out = run(&inner, "run_script", script(&write)).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("read_only: true"), "{}", out.text);
+
+        let mut args = script(&format!("await db.{coll}.countDocuments({{}})"));
+        args["read_only"] = json!("true");
+        let out = run(&inner, "run_script", args).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.starts_with("The script ran read-only"),
+            "{}",
+            out.text
+        );
+
+        let mut args = script(&write);
+        args["dry_run"] = json!(true);
+        let out = run(&inner, "run_script", args).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("nothing was written"), "{}", out.text);
+        assert!(
+            out.text.contains("2 documents would change"),
+            "{}",
+            out.text
+        );
+
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        assert_eq!(
+            c.count_documents(doc! { "b": { "$exists": true } })
+                .await
+                .unwrap(),
+            0
+        );
         c.drop().await.unwrap();
         inner.pool.close_all("test over").await;
     }

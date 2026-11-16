@@ -1,5 +1,6 @@
 mod assistant;
 mod attention;
+mod bulk;
 mod commands;
 mod connection;
 mod connections_io;

@@ -284,6 +284,9 @@ pub fn describe(err: &AppError, detail: Detail) -> String {
             "invalid input (details not logged)".to_string()
         }
         (AppError::TimedOut(_), Detail::NoUserData) => "timed out".to_string(),
+        (AppError::WriteFailed(_), Detail::NoUserData) => {
+            "write error (details not logged)".to_string()
+        }
         _ => err.to_string(),
     };
     scrub_credentials(&text)

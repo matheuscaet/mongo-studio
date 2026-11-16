@@ -36,6 +36,11 @@ pub enum AppError {
     /// carries no prefix and isn't logged.
     #[error("{0}")]
     TimedOut(String),
+    /// Some writes of a batch failed: which ones, and what the others did.
+    /// Quotes the server's messages (a duplicate key's value), so it isn't
+    /// logged.
+    #[error("{0}")]
+    WriteFailed(String),
 }
 
 // Tauri serializes command errors as JSON for the frontend; a plain string

@@ -125,8 +125,8 @@ export function ConsoleSettings() {
       <div role="radiogroup" aria-label="Script engine" className="flex flex-col gap-1.5">
         <EngineOption checked={shown === "builtin"} onSelect={() => setEngine("builtin")} name="Built-in" version="bundled">
           <span className="col-start-2 col-end-4 text-sm leading-[1.45] text-fg-3">
-            Starts instantly, nothing to install. db.collection() with find, aggregate, insert, update, delete and count;
-            no shell helpers like show dbs or rs.status().
+            Starts instantly, nothing to install. Most of mongosh's collection API with await (find, aggregate,
+            insert, update, delete, distinct, bulkWrite); no shell helpers like show dbs or rs.status().
           </span>
         </EngineOption>
         <EngineOption
