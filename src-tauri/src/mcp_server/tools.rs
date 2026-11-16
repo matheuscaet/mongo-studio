@@ -3527,6 +3527,36 @@ mod tests {
         );
     }
 
+    /// A call still connecting says so - not that it waits for the user.
+    #[tokio::test]
+    async fn a_slow_start_is_not_told_as_waiting_for_approval() {
+        let (host, mut inner) = inner(Duration::from_secs(1));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(50));
+        host.state
+            .connection_store
+            .upsert(profile(
+                "dead",
+                "Dead",
+                "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=1500&connectTimeoutMS=1500",
+            ))
+            .unwrap();
+        set_policy(
+            &inner,
+            config(&[("write", Policy::Ask)], &[("dead", Level::Write)]),
+        );
+        let out = run(
+            &inner,
+            "delete_documents",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y", "filter": {} }),
+        )
+        .await;
+        assert!(out.text.starts_with("Still getting ready"), "{}", out.text);
+        assert!(host.events_named(REQUEST_EVENT).is_empty());
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let stopped = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert_eq!(stopped.text, "Stopped it before it ran; nothing ran.");
+    }
+
     #[tokio::test]
     async fn save_script_approved_writes_the_file() {
         let (host, inner) = inner(Duration::from_secs(5));
@@ -4244,6 +4274,47 @@ mod live_tests {
             .connections
             .insert("live".into(), Level::Write);
         run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        inner.pool.close_all("test over").await;
+    }
+
+    /// A client the user disconnects has its calls stopped, also those
+    /// still inside the first 40 seconds.
+    #[tokio::test]
+    #[ignore]
+    async fn live_disconnecting_a_client_stops_its_calls() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let script = format!("await sleep(800); await db.{coll}.insertOne({{ a: 1 }})");
+        let running = {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run(
+                    &inner,
+                    "run_script",
+                    json!({ "connection_id": "live", "database": TEST_DB, "script": script }),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(inner.forget_session("s1"));
+        let out = running.await.unwrap();
+        assert!(out.text.starts_with("Cancelled"), "{}", out.text);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        assert_eq!(c.count_documents(doc! {}).await.unwrap(), 0);
         inner.pool.close_all("test over").await;
     }
 

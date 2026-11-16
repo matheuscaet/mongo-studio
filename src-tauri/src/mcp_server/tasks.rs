@@ -149,7 +149,15 @@ impl Task {
             format!("No need to call {} again.", self.tool)
         };
         let mut text = match state.phase {
-            Phase::Starting | Phase::Approval => format!(
+            Phase::Starting => format!(
+                "Still getting ready after {} (connecting to the server, or counting what the \
+                 call would change): nothing has run, and nothing waits for the user yet \
+                 (task_id \"{id}\"). Call get_task with this task_id to follow it; cancel_task \
+                 stops it. A slow start often means the server is hard to reach (VPN, network). \
+                 {again}",
+                self.elapsed()
+            ),
+            Phase::Approval => format!(
                 "Waiting for the user to approve this in Mongo Studio: the request is shown \
                  there, and nothing has run yet. Tell the user to look at Mongo Studio. Then call \
                  get_task with task_id \"{id}\" to wait for the outcome; cancel_task withdraws \
@@ -257,10 +265,12 @@ where
             running.finish(output);
         }
     });
+    // Known from the start, so a client that goes away (or the server
+    // stopping) stops it even before it outlasts `inline_wait`.
+    inner.tasks.add(task.clone());
     if let Some(output) = task.wait(inner.inline_wait).await {
         return output;
     }
-    inner.tasks.add(task.clone());
     ToolOutput {
         text: task.status_text(0),
         is_error: false,
@@ -317,9 +327,8 @@ pub(crate) fn cancel(inner: &Inner, id: &str) -> ToolOutput {
         };
     }
     let text = match was {
-        Phase::Starting | Phase::Approval => {
-            "Withdrew the request from Mongo Studio; nothing ran.".to_string()
-        }
+        Phase::Starting => "Stopped it before it ran; nothing ran.".to_string(),
+        Phase::Approval => "Withdrew the request from Mongo Studio; nothing ran.".to_string(),
         _ => format!(
             "Stopped {} after {}. Changes it made before that were kept.",
             task.tool,
