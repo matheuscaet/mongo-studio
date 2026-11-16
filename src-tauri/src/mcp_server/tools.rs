@@ -11,6 +11,7 @@
 //! event. Logs name the tool, connection and namespace, never filters,
 //! documents or scripts.
 
+mod documents;
 mod relations;
 
 use std::sync::{Arc, Mutex};
@@ -78,6 +79,7 @@ pub(crate) enum Tool {
     InsertDocuments,
     UpdateDocuments,
     DeleteDocuments,
+    UpsertDocuments,
     CreateCollection,
     DropCollection,
     CreateIndex,
@@ -110,7 +112,7 @@ enum Scope {
 }
 
 impl Tool {
-    const ALL: [Tool; 31] = [
+    const ALL: [Tool; 32] = [
         Tool::ListConnections,
         Tool::ListDatabases,
         Tool::ListCollections,
@@ -123,6 +125,7 @@ impl Tool {
         Tool::InsertDocuments,
         Tool::UpdateDocuments,
         Tool::DeleteDocuments,
+        Tool::UpsertDocuments,
         Tool::CreateCollection,
         Tool::DropCollection,
         Tool::CreateIndex,
@@ -162,6 +165,7 @@ impl Tool {
             Tool::InsertDocuments => "insert_documents",
             Tool::UpdateDocuments => "update_documents",
             Tool::DeleteDocuments => "delete_documents",
+            Tool::UpsertDocuments => "upsert_documents",
             Tool::CreateCollection => "create_collection",
             Tool::DropCollection => "drop_collection",
             Tool::CreateIndex => "create_index",
@@ -197,7 +201,10 @@ impl Tool {
             | Tool::ListIndexes
             | Tool::SampleSchema => Cap::Browse,
             Tool::Find | Tool::Aggregate | Tool::Count | Tool::Explain => Cap::Read,
-            Tool::InsertDocuments | Tool::UpdateDocuments | Tool::DeleteDocuments => Cap::Write,
+            Tool::InsertDocuments
+            | Tool::UpdateDocuments
+            | Tool::DeleteDocuments
+            | Tool::UpsertDocuments => Cap::Write,
             Tool::CreateCollection | Tool::DropCollection | Tool::CreateIndex | Tool::DropIndex => {
                 Cap::Ddl
             }
@@ -265,6 +272,7 @@ impl Tool {
         match self {
             Tool::Aggregate => aggregate_writes(args),
             Tool::RunScript => script_mode(args) == ScriptMode::Normal,
+            tool if documents::is_dry_run(tool, args) => false,
             tool => !matches!(
                 tool.cap(),
                 Cap::Browse | Cap::Read | Cap::ConnList | Cap::RelRead
@@ -324,6 +332,7 @@ fn all_definitions() -> Vec<Value> {
     let allow_disk_use = json!({ "type": "boolean", "default": false, "description": "Let large sorts and groups spill to disk (allowDiskUse)." });
     let read_only =
         json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
+    let dry_run = json!({ "type": "boolean", "default": false, "description": "Change nothing: report how many documents would change. Needs only read access." });
     let writes = json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false });
     let destructive =
         json!({ "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false });
@@ -425,7 +434,8 @@ fn all_definitions() -> Vec<Value> {
             "name": "insert_documents",
             "description": "Insert documents (Extended JSON) into a collection. Needs write access; the user may have to approve it in Mongo Studio first.",
             "inputSchema": on_coll(json!({
-                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents to insert." }
+                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents to insert." },
+                "dry_run": { "type": "boolean", "default": false, "description": "Insert nothing: check the documents and report which would clash with an existing _id or a unique index. Needs only read access." },
             }), &["documents"]),
             "annotations": writes,
         }),
@@ -437,6 +447,7 @@ fn all_definitions() -> Vec<Value> {
                 "update": { "type": "object", "description": "Update document, e.g. {\"$set\": {\"status\": \"archived\"}}." },
                 "many": { "type": "boolean", "default": false, "description": "Update every matching document instead of the first." },
                 "upsert": { "type": "boolean", "default": false, "description": "Insert a document when none matches." },
+                "dry_run": dry_run.clone(),
             }), &["filter", "update"]),
             "annotations": destructive,
         }),
@@ -446,7 +457,19 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": on_coll(json!({
                 "filter": filter,
                 "many": { "type": "boolean", "default": false, "description": "Delete every matching document instead of the first." },
+                "dry_run": dry_run.clone(),
             }), &["filter"]),
+            "annotations": destructive,
+        }),
+        json!({
+            "name": "upsert_documents",
+            "description": "Insert or update many documents in one call, matching each by its key fields (like a bulkWrite of updateOne with upsert). A document whose keys match none is inserted; one that matches is updated with $set of its fields, or left as it is with only_insert ($setOnInsert). Reports how many already exist before anything changes. Needs write access; the user may have to approve it in Mongo Studio first.",
+            "inputSchema": on_coll(json!({
+                "keys": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The fields that identify a document, e.g. [\"subDomain\", \"product\"]. Every document must have them, and no two the same values." },
+                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents, in Extended JSON." },
+                "only_insert": { "type": "boolean", "default": false, "description": "Insert the documents that don't exist yet and leave existing ones untouched." },
+                "dry_run": dry_run,
+            }), &["keys", "documents"]),
             "annotations": destructive,
         }),
         json!({
@@ -774,6 +797,8 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
     let config = call.inner.config();
     let cap = match tool {
         Tool::Aggregate if aggregate_writes(args) => Cap::Write,
+        // A dry run only reads.
+        _ if documents::is_dry_run(tool, args) => Cap::Read,
         Tool::TestRelation if policy::cap_policy(&config, Cap::RelRead) == Policy::Off => {
             Cap::RelEdit
         }
@@ -1406,6 +1431,25 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
                 dry_run: Some(dry_run_text(DryRun::Update { matched, upsert })),
             }
         }
+        Tool::UpsertDocuments => {
+            let upsert = documents::upsert_args(args)?;
+            let mongo = mongo.expect("upsert_documents uses mongo");
+            let existing = upsert.existing(mongo, db, coll).await?;
+            let n = upsert.docs.len() as u64;
+            Plan {
+                title: format!(
+                    "Upsert {} on {ns}{}",
+                    plural(n, "document", "documents"),
+                    if upsert.only_insert {
+                        " (only insert)"
+                    } else {
+                        ""
+                    }
+                ),
+                code: on_coll(upsert.code()),
+                dry_run: Some(upsert.dry_run_text(existing)),
+            }
+        }
         Tool::DeleteDocuments => {
             let filter = doc_of(args, "filter")?;
             let many = bool_of(args, "many");
@@ -1514,6 +1558,12 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
         }
         _ => relations::plan(call, args)?,
     })
+    .map(|mut plan| {
+        if documents::is_dry_run(call.tool, args) {
+            plan.title = format!("Dry run of {}", plan.title);
+        }
+        plan
+    })
 }
 
 fn documents_of(args: &Value) -> AppResult<Vec<Value>> {
@@ -1581,6 +1631,9 @@ async fn execute(
         tool if tool.is_relation_tool() => relations::execute(call, args, mongo).await,
         _ => {
             let client = mongo.expect("data tools have a client");
+            if documents::is_dry_run(call.tool, args) {
+                return dry_run_only(client, db, coll, args, call.tool, plan).await;
+            }
             match call.tool {
                 Tool::ListDatabases => {
                     let dbs = timed!(async {
@@ -1700,6 +1753,37 @@ async fn execute(
                         ),
                     })
                 }
+                Tool::UpsertDocuments => {
+                    let upsert = documents::upsert_args(args)?;
+                    let result = timed!(crate::bulk::bulk_write(
+                        client,
+                        db,
+                        coll,
+                        upsert.ops(),
+                        false,
+                        None,
+                    ))
+                    .await?;
+                    let inserted = plural(result.upserted, "document", "documents");
+                    let text = if upsert.only_insert {
+                        format!(
+                            "{dry}Inserted {inserted} into {ns}; {} already existed and were left as they were.",
+                            result.matched
+                        )
+                    } else {
+                        format!(
+                            "{dry}Upserted into {ns}: inserted {inserted}, matched {} (modified {}).",
+                            result.matched, result.modified
+                        )
+                    };
+                    Ok(Done {
+                        text,
+                        meta: format!(
+                            "{} inserted · {} modified",
+                            result.upserted, result.modified
+                        ),
+                    })
+                }
                 Tool::DeleteDocuments => {
                     let filter = doc_of(args, "filter")?;
                     let many = bool_of(args, "many");
@@ -1774,6 +1858,39 @@ async fn execute(
             }
         }
     }
+}
+
+/// A document write's dry run: what the plan counted, and for inserts
+/// the documents that would clash.
+async fn dry_run_only(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &Value,
+    tool: Tool,
+    plan: &Plan,
+) -> AppResult<Done> {
+    let counted = plan.dry_run.clone().unwrap_or_default();
+    let mut text = format!("Dry run: nothing was written. {counted}.");
+    if tool == Tool::InsertDocuments {
+        let docs: Vec<Document> = documents_of(args)?
+            .into_iter()
+            .map(json_to_document)
+            .collect::<AppResult<_>>()?;
+        let problems = documents::insert_problems(client, db, coll, &docs).await?;
+        if problems.is_empty() {
+            text.push_str(" No _id or unique index clashes were found.");
+        } else {
+            text.push_str(&format!(
+                "\nThese would fail (documents numbered from 0):\n- {}",
+                problems.join("\n- ")
+            ));
+        }
+    }
+    Ok(Done {
+        text,
+        meta: format!("dry run · {counted}"),
+    })
 }
 
 type BoxedOp<'a, T> =
@@ -3385,6 +3502,81 @@ mod live_tests {
         assert!(out.text.contains("s_1"), "{}", out.text);
         let out = run(&inner, "drop_collection", on(&coll, json!({}))).await;
         assert!(!out.is_error, "{}", out.text);
+        inner.pool.close_all("test over").await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_upserts_and_insert_dry_runs() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let out = run(&inner, "run_script", json!({ "connection_id": "live", "database": TEST_DB,
+            "script": format!("await db.{coll}.createIndex({{ email: 1 }}, {{ unique: true, sparse: true }}); await db.{coll}.insertOne({{ _id: 1, sub: 'a', product: 'chat', credits: 1, email: 'a@x' }})") })).await;
+        assert!(!out.is_error, "{}", out.text);
+        let docs = json!([
+            { "sub": "a", "product": "chat", "credits": 5 },
+            { "sub": "b", "product": "chat", "credits": 7 },
+        ]);
+
+        let mut args = on(
+            &coll,
+            json!({ "keys": ["sub", "product"], "documents": docs, "only_insert": true, "dry_run": true }),
+        );
+        let out = run(&inner, "upsert_documents", args.clone()).await;
+        assert!(out.text.starts_with("Dry run: nothing was written. 1 document would be inserted; 1 document already exists and would be left as they are"), "{}", out.text);
+        args["dry_run"] = json!(false);
+        let out = run(&inner, "upsert_documents", args).await;
+        assert!(out.text.contains("Inserted 1 document"), "{}", out.text);
+        assert!(out.text.contains("1 already existed"), "{}", out.text);
+
+        let out = run(&inner, "upsert_documents", on(&coll, json!({ "keys": ["sub", "product"], "documents": [{ "sub": "a", "product": "chat", "credits": 9 }] }))).await;
+        assert!(out.text.contains("matched 1 (modified 1)"), "{}", out.text);
+        let out = run(
+            &inner,
+            "count",
+            on(&coll, json!({ "filter": { "credits": { "$in": [9, 7] } } })),
+        )
+        .await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+
+        let out = run(
+            &inner,
+            "insert_documents",
+            on(
+                &coll,
+                json!({ "dry_run": true, "documents": [
+            { "_id": 1 }, { "_id": 2, "email": "a@x" }, { "_id": 3, "email": "n@x" }, { "_id": 3 }
+        ] }),
+            ),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("4 documents would be inserted"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("1 document has an _id that the collection already has: #0"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("repeats an _id of an earlier document in the list: #3"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("unique index email_1 (email) that the collection already has: #1"),
+            "{}",
+            out.text
+        );
+        let out = run(&inner, "count", on(&coll, json!({}))).await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+        run(&inner, "drop_collection", on(&coll, json!({}))).await;
         inner.pool.close_all("test over").await;
     }
 
