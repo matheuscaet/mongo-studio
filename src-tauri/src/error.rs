@@ -41,6 +41,10 @@ pub enum AppError {
     /// logged.
     #[error("{0}")]
     WriteFailed(String),
+    /// The connection to the server was lost or couldn't be made; the
+    /// message says what to check.
+    #[error("{0}")]
+    Network(String),
 }
 
 // Tauri serializes command errors as JSON for the frontend; a plain string

@@ -176,6 +176,7 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
                 failed += 1;
                 stopped = stop_on_error;
                 sections.push(format!("{heading}\nFailed to connect: {}", message(&e)));
+                forget_if_lost(call, profile, &e).await;
                 continue;
             }
         };
@@ -190,6 +191,7 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
                 failed += 1;
                 stopped = stop_on_error;
                 sections.push(format!("{heading}\nFailed: {}", message(&e)));
+                forget_if_lost(call, profile, &e).await;
             }
         }
     }
@@ -220,7 +222,22 @@ pub(super) async fn run(call: &mut Call<'_>, args: &Value) -> ToolOutput {
 }
 
 fn message(error: &AppError) -> String {
-    logging::scrub_credentials(&error.to_string())
+    let text = logging::scrub_credentials(&error.to_string());
+    if super::lost_connection(error) {
+        format!("{text} - the connection was lost: check the VPN or the network.")
+    } else {
+        text
+    }
+}
+
+/// A lost connection's client is dropped, so the next call reconnects.
+async fn forget_if_lost(call: &Call<'_>, profile: &ConnectionProfile, error: &AppError) {
+    if super::lost_connection(error) {
+        call.inner
+            .pool
+            .close(&profile.id, "the connection was lost")
+            .await;
+    }
 }
 
 fn add(total: &mut WriteTally, more: &WriteTally) {

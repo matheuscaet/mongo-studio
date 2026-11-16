@@ -697,6 +697,8 @@ struct Call<'a> {
     started: Instant,
     /// Followed by get_task when the call outlasts `inline_wait`.
     task: Arc<Task>,
+    /// A read that lost its connection and ran again.
+    retried: bool,
 }
 
 impl Call<'_> {
@@ -740,12 +742,44 @@ impl Call<'_> {
         );
     }
 
+    /// A lost connection, told as one: what to check, whether the call
+    /// was retried, and that a write may or may not have been applied. The
+    /// connection's client is dropped, so the next call connects afresh
+    /// (and opens a new SSH tunnel).
+    fn network_error(&self, error: AppError) -> AppError {
+        let Some(profile) = &self.target.profile else {
+            return error;
+        };
+        if !lost_connection(&error) {
+            return error;
+        }
+        let inner = self.inner.clone();
+        let id = profile.id.clone();
+        tokio::spawn(async move { inner.pool.close(&id, "the connection was lost").await });
+        let original = logging::scrub_credentials(&error.to_string());
+        let mut text = format!(
+            "Lost the connection to \"{}\" ({original}). Check the VPN or the network{} and try again.",
+            profile.name,
+            if profile.ssh_tunnel.is_some() { ", and the SSH server" } else { "" },
+        );
+        if self.retried {
+            text.push_str(" The call was retried once after reconnecting, and failed again.");
+        } else if self.task.changes_data && self.task.phase() == Phase::Running {
+            text.push_str(
+                " It changes data, so it wasn't retried: check whether it was applied before \
+                 running it again.",
+            );
+        }
+        AppError::Network(text)
+    }
+
     fn refuse(&self, label: &str, text: &str) -> ToolOutput {
         self.log(label);
         self.finish("warn", label.to_string(), String::new(), text.to_string())
     }
 
     fn fail(&self, error: AppError) -> ToolOutput {
+        let error = self.network_error(error);
         self.log(&format!(
             "failed: {}",
             logging::describe(&error, Detail::NoUserData)
@@ -790,6 +824,7 @@ pub(crate) async fn call(
             target: Target::default(),
             started: Instant::now(),
             task: followed,
+            retried: false,
         };
         run_call(&mut call, &args).await
     };
@@ -947,13 +982,35 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
         _ => OP_TIMEOUT,
     };
-    let result = tokio::time::timeout(timeout, execute(call, args, mongo.as_ref(), &plan))
+    let timed_out = || {
+        Err(AppError::InvalidInput(
+            "The operation timed out.".to_string(),
+        ))
+    };
+    let mut result = tokio::time::timeout(timeout, execute(call, args, mongo.as_ref(), &plan))
         .await
-        .unwrap_or_else(|_| {
-            Err(AppError::InvalidInput(
-                "The operation timed out.".to_string(),
-            ))
-        });
+        .unwrap_or_else(|_| timed_out());
+    // A read that lost its connection runs once more on a fresh one.
+    let lost = matches!(&result, Err(e) if lost_connection(e));
+    if lost && tool.uses_mongo() && !tool.changes_data(args) {
+        let profile = call.target.profile.clone().expect("checked above");
+        call.inner
+            .pool
+            .close(&profile.id, "the connection was lost")
+            .await;
+        call.retried = true;
+        log::info!("MCP: {} lost its connection; retrying once", tool.name());
+        if let Ok(fresh) = call
+            .inner
+            .pool
+            .client(call.inner.host.as_ref(), &profile)
+            .await
+        {
+            result = tokio::time::timeout(timeout, execute(call, args, Some(&fresh), &plan))
+                .await
+                .unwrap_or_else(|_| timed_out());
+        }
+    }
     match result {
         Ok(done) => {
             call.log(label);
@@ -961,6 +1018,62 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
         Err(e) => call.fail(e),
     }
+}
+
+/// Whether an error says the connection to the server was lost or
+/// couldn't be made: a reset (os error 10054 on Windows, 104 on Linux), a
+/// timeout, no reachable server, a dead SSH tunnel. Script errors arrive as
+/// text, so the text is read too.
+pub(crate) fn lost_connection(error: &AppError) -> bool {
+    use mongodb::error::ErrorKind;
+    match error {
+        AppError::Mongo(e) => {
+            matches!(
+                e.kind.as_ref(),
+                ErrorKind::Io(_)
+                    | ErrorKind::ConnectionPoolCleared { .. }
+                    | ErrorKind::ServerSelection { .. }
+            ) || e.contains_label("NetworkError")
+        }
+        AppError::Io(_) | AppError::Ssh(_) | AppError::Network(_) => true,
+        AppError::InvalidInput(text) => says_network(text),
+        _ => false,
+    }
+}
+
+fn says_network(text: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "os error 10050",
+        "os error 10051",
+        "os error 10053",
+        "os error 10054",
+        "os error 10060",
+        "os error 10061",
+        "os error 10065",
+        "os error 32)",
+        "os error 101)",
+        "os error 103)",
+        "os error 104)",
+        "os error 110)",
+        "os error 111)",
+        "os error 113)",
+        "connection reset",
+        "broken pipe",
+        "connection refused",
+        "connection aborted",
+        "network is unreachable",
+        "host is unreachable",
+        "server selection timeout",
+        "no available servers",
+        "connection pool for",
+    ];
+    let text = text.to_ascii_lowercase();
+    // Only the driver's own errors, as a script passes them on: a script
+    // that throws "connection refused" itself isn't a lost connection.
+    let from_driver = text.contains("database error:")
+        || text.contains("ssh tunnel error:")
+        || text.contains("server selection timeout");
+    from_driver && SIGNS.iter().any(|sign| text.contains(sign))
 }
 
 /// The stricter of two decisions, with its capability: off, then no
@@ -2704,6 +2817,28 @@ mod tests {
     }
 
     #[test]
+    fn lost_connections_are_told_from_other_errors() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(lost_connection(&AppError::Io(reset)));
+        assert!(lost_connection(&AppError::InvalidInput(
+            "database error: Kind: I/O error: An existing connection was forcibly closed by the remote host. (os error 10054)".into()
+        )));
+        assert!(lost_connection(&AppError::InvalidInput(
+            "Server selection timeout: No available servers. Topology: { Type: Unknown }".into()
+        )));
+        assert!(!lost_connection(&AppError::InvalidInput(
+            "ReferenceError: x is not defined".into()
+        )));
+        // a script's own error that only sounds like one
+        assert!(!lost_connection(&AppError::InvalidInput(
+            "Error: connection refused by the API".into()
+        )));
+        assert!(!lost_connection(&AppError::NotFound(
+            "no such connection".into()
+        )));
+    }
+
+    #[test]
     fn dry_run_summaries() {
         assert_eq!(
             dry_run_text(DryRun::Update {
@@ -3074,6 +3209,52 @@ mod tests {
         assert!(unknown.is_error);
     }
 
+    /// A server that can't be reached is told as a lost connection, with
+    /// what to check; a read is retried once, a write isn't.
+    #[tokio::test]
+    async fn unreachable_servers_say_to_check_the_network() {
+        let (host, inner) = inner(Duration::from_secs(1));
+        host.state
+            .connection_store
+            .upsert(profile(
+                "dead",
+                "Dead",
+                "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+            ))
+            .unwrap();
+        set_policy(
+            &inner,
+            config(
+                &[("read", Policy::Allow), ("write", Policy::Allow)],
+                &[("dead", Level::Write)],
+            ),
+        );
+        let out = run(
+            &inner,
+            "count",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y" }),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.text.starts_with("Lost the connection to \"Dead\""),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Check the VPN or the network"),
+            "{}",
+            out.text
+        );
+        let out = run(
+            &inner,
+            "delete_documents",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y", "filter": {} }),
+        )
+        .await;
+        assert!(out.text.starts_with("Lost the connection"), "{}", out.text);
+    }
+
     #[tokio::test]
     async fn save_script_approved_writes_the_file() {
         let (host, inner) = inner(Duration::from_secs(5));
@@ -3382,12 +3563,12 @@ mod live_tests {
     #[ignore]
     async fn live_long_scripts_go_on_as_tasks() {
         let (host, mut inner) = setup(Duration::from_secs(1));
-        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(300));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(1000));
         let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
         let c = format!("db.getCollection('{coll}')");
         let script = format!(
             "await {c}.insertMany([{{a:1}},{{a:2}}]); print('inserted'); \
-             const n = (await {c}.find({{ $where: 'sleep(400) || true' }})).length; print('read ' + n); n"
+             const n = (await {c}.find({{ $where: 'sleep(1000) || true' }})).length; print('read ' + n); n"
         );
         let args = json!({ "connection_id": "live", "database": TEST_DB, "script": script });
         let out = run(&inner, "run_script", args.clone()).await;
