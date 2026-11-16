@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Document};
-use mongodb::options::IndexOptions;
+use mongodb::options::{Hint, IndexOptions};
 use mongodb::{Client, IndexModel};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -42,6 +42,9 @@ use crate::state::CancelToken;
 
 /// Server-side limit on reads.
 const MAX_TIME: Duration = Duration::from_secs(30);
+/// max_time_ms of find, aggregate, count and explain.
+const DEFAULT_READ_MS: i64 = 30_000;
+const MAX_READ_MS: i64 = 10 * 60_000;
 /// Client-side backstop for one operation (scripts have their own timeout).
 const OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Tool output is cut here.
@@ -315,6 +318,10 @@ fn all_definitions() -> Vec<Value> {
     let pipeline = json!({ "type": "array", "items": { "type": "object" }, "description": "Aggregation pipeline stages in Extended JSON." });
     let sort =
         json!({ "type": "object", "description": "Sort specification, e.g. {\"createdAt\": -1}." });
+    let max_time_ms = json!({ "type": "integer", "minimum": 1, "maximum": MAX_READ_MS, "default": DEFAULT_READ_MS, "description": "Server-side time limit in milliseconds (maxTimeMS). A call that outlasts about 40 seconds goes on in the background (see get_task)." });
+    // No "type": a list of types trips up some clients' schema checks.
+    let hint = json!({ "description": "Index to use: its name (see list_indexes) or key pattern, e.g. \"status_1_createdAt_-1\" or {\"status\": 1, \"createdAt\": -1}." });
+    let allow_disk_use = json!({ "type": "boolean", "default": false, "description": "Let large sorts and groups spill to disk (allowDiskUse)." });
     let read_only =
         json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
     let writes = json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false });
@@ -384,6 +391,9 @@ fn all_definitions() -> Vec<Value> {
                 "sort": sort,
                 "skip": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DOCS, "default": DEFAULT_DOCS },
+                "hint": hint,
+                "max_time_ms": max_time_ms,
+                "allow_disk_use": allow_disk_use,
             }), &[]),
             "annotations": read_only,
         }),
@@ -393,19 +403,22 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": on_coll(json!({
                 "pipeline": pipeline,
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DOCS, "default": DEFAULT_DOCS, "description": "How many result documents to return." },
+                "hint": hint,
+                "max_time_ms": max_time_ms,
+                "allow_disk_use": allow_disk_use,
             }), &["pipeline"]),
             "annotations": read_only,
         }),
         json!({
             "name": "count",
             "description": "Count the documents matching a filter (exact count).",
-            "inputSchema": on_coll(json!({ "filter": filter }), &[]),
+            "inputSchema": on_coll(json!({ "filter": filter, "hint": hint, "max_time_ms": max_time_ms }), &[]),
             "annotations": read_only,
         }),
         json!({
             "name": "explain",
             "description": "Explain a find (filter and sort) or an aggregation pipeline with executionStats, and summarize the winning plan: stages, index used, keys and documents examined, documents returned, time.",
-            "inputSchema": on_coll(json!({ "filter": filter, "sort": sort, "pipeline": pipeline }), &[]),
+            "inputSchema": on_coll(json!({ "filter": filter, "sort": sort, "pipeline": pipeline, "hint": hint, "max_time_ms": max_time_ms, "allow_disk_use": allow_disk_use }), &[]),
             "annotations": read_only,
         }),
         json!({
@@ -871,6 +884,9 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         Tool::RunScript => {
             Duration::from_millis(script_timeout(args) as u64) + Duration::from_secs(30)
         }
+        Tool::Find | Tool::Aggregate | Tool::Count | Tool::Explain => {
+            OP_TIMEOUT.max(read_time(args) + Duration::from_secs(30))
+        }
         _ => OP_TIMEOUT,
     };
     let result = tokio::time::timeout(timeout, execute(call, args, mongo.as_ref(), &plan))
@@ -1061,6 +1077,64 @@ async fn run_script(
     ScriptOutcome { result }
 }
 
+/// `.hint(...).maxTimeMS(...).allowDiskUse()` for a find's approval card.
+fn read_options_code(args: &Value) -> AppResult<String> {
+    let mut code = String::new();
+    if let Some(hint) = hint_of(args)? {
+        code.push_str(&format!(".hint({})", bson_to_json(hint_bson(hint))));
+    }
+    if args.get("max_time_ms").is_some() {
+        code.push_str(&format!(".maxTimeMS({})", read_time(args).as_millis()));
+    }
+    if bool_of(args, "allow_disk_use") {
+        code.push_str(".allowDiskUse()");
+    }
+    Ok(code)
+}
+
+/// max_time_ms of a read: 30 s unless the call says otherwise.
+fn read_time(args: &Value) -> Duration {
+    Duration::from_millis(int_arg(args, "max_time_ms", DEFAULT_READ_MS, MAX_READ_MS) as u64)
+}
+
+/// `hint`: an index name, or a key pattern (also as a JSON string).
+fn hint_of(args: &Value) -> AppResult<Option<Hint>> {
+    match args.get("hint") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) if s.trim_start().starts_with('{') => {
+            let keys = serde_json::from_str::<Value>(s)
+                .map_err(|e| invalid(format!("hint is not valid JSON: {e}")))?;
+            Ok(Some(Hint::Keys(json_to_document(keys)?)))
+        }
+        Some(Value::String(name)) => Ok(Some(Hint::Name(name.trim().to_string()))),
+        Some(keys @ Value::Object(_)) => Ok(Some(Hint::Keys(json_to_document(keys.clone())?))),
+        Some(_) => Err(invalid(
+            "hint must be an index name or a key pattern object.",
+        )),
+    }
+}
+
+fn hint_bson(hint: Hint) -> mongodb::bson::Bson {
+    match hint {
+        Hint::Keys(keys) => keys.into(),
+        Hint::Name(name) => name.into(),
+        _ => mongodb::bson::Bson::Null,
+    }
+}
+
+/// Applies an optional setting to a driver action.
+trait Optional: Sized {
+    fn optional<T>(self, value: Option<T>, apply: impl FnOnce(Self, T) -> Self) -> Self {
+        match value {
+            Some(value) => apply(self, value),
+            None => self,
+        }
+    }
+}
+
+impl<T> Optional for T {}
+
 fn doc_of(args: &Value, key: &str) -> AppResult<Document> {
     doc_arg(args, key).map_err(AppError::InvalidInput)
 }
@@ -1222,12 +1296,33 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
             }
             let limit = int_arg(args, "limit", DEFAULT_DOCS, MAX_DOCS);
             statement.push_str(&format!(".limit({limit})"));
+            statement.push_str(&read_options_code(args)?);
             plan(format!("find on {ns}"), on_coll(statement))
         }
         Tool::Aggregate => {
             let stages = pipeline_of(args)?;
             let writes = pipeline_writes(&stages);
-            let code = on_coll(format!("aggregate({})", js(&Value::Array(stages.clone()))));
+            let mut options = Map::new();
+            if let Some(hint) = hint_of(args)? {
+                options.insert("hint".into(), bson_to_json(hint_bson(hint)));
+            }
+            if args.get("max_time_ms").is_some() {
+                options.insert(
+                    "maxTimeMS".into(),
+                    json!(read_time(args).as_millis() as u64),
+                );
+            }
+            if bool_of(args, "allow_disk_use") {
+                options.insert("allowDiskUse".into(), json!(true));
+            }
+            let options = match options.is_empty() {
+                true => String::new(),
+                false => format!(", {}", js(&Value::Object(options))),
+            };
+            let code = on_coll(format!(
+                "aggregate({}{options})",
+                js(&Value::Array(stages.clone()))
+            ));
             stages_of(stages)?;
             let title = if writes {
                 format!("aggregate with $out/$merge on {ns}")
@@ -1544,7 +1639,8 @@ async fn execute(
                     let n = timed!(async {
                         Ok(collection(client, db, coll)
                             .count_documents(filter)
-                            .max_time(MAX_TIME)
+                            .max_time(read_time(args))
+                            .optional(hint_of(args)?, |c, h| c.hint(h))
                             .await?)
                     })
                     .await?;
@@ -1750,7 +1846,11 @@ fn find<'a>(
             .find(doc_of(args, "filter")?)
             .limit(limit)
             .skip(skip)
-            .max_time(MAX_TIME);
+            .max_time(read_time(args))
+            .optional(hint_of(args)?, |f, h| f.hint(h));
+        if bool_of(args, "allow_disk_use") {
+            find = find.allow_disk_use(true);
+        }
         if let Some(projection) = opt_doc_of(args, "projection")? {
             find = find.projection(projection);
         }
@@ -1797,7 +1897,15 @@ fn aggregate<'a>(
         let started = Instant::now();
         let mut docs: Vec<Document> = collection(client, db, coll)
             .aggregate(stages)
-            .max_time(if writes { OP_TIMEOUT } else { MAX_TIME })
+            .max_time(if writes {
+                read_time(args).max(OP_TIMEOUT)
+            } else {
+                read_time(args)
+            })
+            .optional(hint_of(args)?, |a, h| a.hint(h))
+            .optional(bool_of(args, "allow_disk_use").then_some(true), |a, v| {
+                a.allow_disk_use(v)
+            })
             .await?
             .try_collect()
             .await?;
@@ -1840,8 +1948,8 @@ fn explain<'a>(
     args: &'a Value,
 ) -> BoxedOp<'a, Done> {
     Box::pin(async move {
-        let max_time_ms = MAX_TIME.as_millis() as i64;
-        let command = match json_of(args, "pipeline")? {
+        let max_time_ms = read_time(args).as_millis() as i64;
+        let mut command = match json_of(args, "pipeline")? {
             Some(Value::Array(stages)) => {
                 doc! { "aggregate": coll, "pipeline": stages_of(stages)?, "cursor": {}, "maxTimeMS": max_time_ms }
             }
@@ -1855,6 +1963,12 @@ fn explain<'a>(
                 command
             }
         };
+        if let Some(hint) = hint_of(args)? {
+            command.insert("hint", hint_bson(hint));
+        }
+        if bool_of(args, "allow_disk_use") && command.contains_key("aggregate") {
+            command.insert("allowDiskUse", true);
+        }
         let result = client
             .database(db)
             .run_command(doc! { "explain": command, "verbosity": "executionStats" })
@@ -3241,6 +3355,36 @@ mod live_tests {
             0
         );
         c.drop().await.unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// hint, max_time_ms and allow_disk_use reach the server: a hint that
+    /// names no index is the server's error, not ignored.
+    #[tokio::test]
+    #[ignore]
+    async fn live_reads_take_hint_max_time_and_disk_use() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let out = run(&inner, "run_script", json!({ "connection_id": "live", "database": TEST_DB,
+            "script": format!("await db.{coll}.insertMany([{{s: 1}}, {{s: 2}}]); await db.{coll}.createIndex({{ s: 1 }})") })).await;
+        assert!(!out.is_error, "{}", out.text);
+        let out = run(&inner, "find", on(&coll, json!({ "filter": { "s": 1 }, "hint": "s_1", "max_time_ms": "5000", "allow_disk_use": true }))).await;
+        assert!(out.text.starts_with("Returned 1 document"), "{}", out.text);
+        let out = run(&inner, "find", on(&coll, json!({ "hint": "nope_1" }))).await;
+        assert!(out.is_error, "{}", out.text);
+        let out = run(&inner, "count", on(&coll, json!({ "hint": { "s": 1 } }))).await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+        let out = run(&inner, "aggregate", on(&coll, json!({ "pipeline": [{ "$sort": { "s": -1 } }], "allow_disk_use": true, "hint": "{\"s\": 1}" }))).await;
+        assert!(out.text.contains("returned 2 documents"), "{}", out.text);
+        let out = run(
+            &inner,
+            "explain",
+            on(&coll, json!({ "filter": { "s": 2 }, "hint": "s_1" })),
+        )
+        .await;
+        assert!(out.text.contains("s_1"), "{}", out.text);
+        let out = run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        assert!(!out.is_error, "{}", out.text);
         inner.pool.close_all("test over").await;
     }
 
