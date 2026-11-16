@@ -13,7 +13,7 @@
 
 mod relations;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
@@ -28,8 +28,8 @@ use super::{
     now_ms, ClientSession, Inner, Level, McpConfig, Policy, ACTIVITY_EVENT, CONNECTION_EVENT,
 };
 use crate::assistant::{
-    doc_arg, infer_schema, int_arg, opt_doc_arg, opt_json_arg, pipeline_writes, plural,
-    render_schema, str_arg, summarize_explain, thousands, truncate,
+    bool_arg, doc_arg, infer_schema, int_arg, opt_doc_arg, opt_int_arg, opt_json_arg,
+    pipeline_writes, plural, render_schema, str_arg, summarize_explain, thousands, truncate,
 };
 use crate::connection::extract_uri_credentials;
 use crate::ejson::{bson_to_json, document_to_json, json_to_document};
@@ -824,6 +824,34 @@ fn script_timeout(args: &Value) -> i64 {
     int_arg(args, "timeout_ms", DEFAULT_SCRIPT_MS, MAX_SCRIPT_MS).max(1000)
 }
 
+/// Cancels its token when dropped.
+struct CancelOnDrop(CancelToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// A script stopped at its time limit: what it printed until then, which
+/// tells how far it got.
+fn script_timed_out(timeout_ms: u64, printed: &[String]) -> AppError {
+    let mut text = format!(
+        "The script was stopped after {} (timeout_ms = {timeout_ms}). Writes it made before \
+         that were kept. Raise timeout_ms (up to {MAX_SCRIPT_MS}) or split the work.",
+        crate::mongosh::describe_ms(timeout_ms)
+    );
+    if printed.is_empty() {
+        text.push_str("\nIt printed nothing before it stopped.");
+    } else {
+        text.push_str(&format!(
+            "\nPrinted before it stopped:\n{}",
+            printed.join("\n")
+        ));
+    }
+    AppError::TimedOut(text)
+}
+
 fn doc_of(args: &Value, key: &str) -> AppResult<Document> {
     doc_arg(args, key).map_err(AppError::InvalidInput)
 }
@@ -837,7 +865,12 @@ fn json_of(args: &Value, key: &str) -> AppResult<Option<Value>> {
 }
 
 fn bool_of(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+    bool_arg(args, key)
+}
+
+/// `skip`: a count of documents, 0 when absent or negative.
+fn skip_of(args: &Value) -> u64 {
+    opt_int_arg(args, "skip").unwrap_or(0).max(0) as u64
 }
 
 fn pipeline_of(args: &Value) -> AppResult<Vec<Value>> {
@@ -974,7 +1007,7 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
             if let Some(sort) = json_of(args, "sort")? {
                 statement.push_str(&format!(".sort({})", js(&sort)));
             }
-            let skip = args.get("skip").and_then(Value::as_i64).unwrap_or(0);
+            let skip = skip_of(args);
             if skip > 0 {
                 statement.push_str(&format!(".skip({skip})"));
             }
@@ -1422,15 +1455,29 @@ async fn execute(
                 Tool::RunScript => {
                     let script = script_of(args)?;
                     let timeout = script_timeout(args) as u64;
-                    let result = timed!(crate::scripting::run_script(
+                    let printed = Arc::new(Mutex::new(Vec::<String>::new()));
+                    let sink = printed.clone();
+                    // Stops the script, and the query it waits on, when the
+                    // call ends early: past timeout_ms, or dropped.
+                    let stop = CancelOnDrop(CancelToken::default());
+                    let run = timed!(crate::scripting::run_script(
                         client.clone(),
                         db.to_string(),
                         script,
-                        Some(timeout),
-                        CancelToken::default(),
-                        |_| {},
-                    ))
-                    .await?;
+                        // The engine's own limit only interrupts JavaScript;
+                        // the one below also stops a query in flight.
+                        Some(timeout + 5_000),
+                        stop.0.clone(),
+                        move |line| sink.lock().unwrap().push(line),
+                    ));
+                    let result = tokio::select! {
+                        result = run => result?,
+                        () = tokio::time::sleep(Duration::from_millis(timeout)) => {
+                            stop.0.cancel();
+                            let printed = printed.lock().unwrap();
+                            return Err(script_timed_out(timeout, &printed));
+                        }
+                    };
                     let mut text = format!(
                         "The script ran on {db} (db is now {}).\nResult (relaxed Extended JSON):\n{}",
                         result.database,
@@ -1517,7 +1564,7 @@ fn find<'a>(
 ) -> BoxedOp<'a, Done> {
     Box::pin(async move {
         let limit = int_arg(args, "limit", DEFAULT_DOCS, MAX_DOCS);
-        let skip = args.get("skip").and_then(Value::as_u64).unwrap_or(0);
+        let skip = skip_of(args);
         let c = collection(client, db, coll);
         let mut find = c
             .find(doc_of(args, "filter")?)
@@ -2192,6 +2239,25 @@ mod tests {
     }
 
     #[test]
+    fn numbers_and_booleans_sent_as_strings_are_read() {
+        let args = json!({ "timeout_ms": "120000", "skip": "40", "many": "true", "upsert": false });
+        assert_eq!(script_timeout(&args), 120_000);
+        assert_eq!(skip_of(&args), 40);
+        assert!(bool_of(&args, "many"));
+        assert!(!bool_of(&args, "upsert"));
+        assert_eq!(script_timeout(&json!({ "timeout_ms": 90000.0 })), 90_000);
+        assert_eq!(
+            script_timeout(&json!({ "timeout_ms": "soon" })),
+            DEFAULT_SCRIPT_MS
+        );
+        assert_eq!(
+            script_timeout(&json!({ "timeout_ms": "999999" })),
+            MAX_SCRIPT_MS
+        );
+        assert_eq!(skip_of(&json!({ "skip": -3 })), 0);
+    }
+
+    #[test]
     fn dry_run_summaries() {
         assert_eq!(
             dry_run_text(DryRun::Update {
@@ -2723,6 +2789,59 @@ mod live_tests {
         let out = run(&inner, "drop_collection", on(&coll, json!({}))).await;
         assert!(out.text.contains("Dropped the collection"), "{}", out.text);
         assert_eq!(inner.pool.len().await, 1);
+        inner.pool.close_all("test over").await;
+    }
+
+    /// timeout_ms is honored even sent as a string, and stops the query
+    /// in flight, handing back what the script printed.
+    #[tokio::test]
+    #[ignore]
+    async fn live_script_timeout_stops_it_and_keeps_its_output() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let c = format!("db.getCollection('{coll}')");
+        let script = format!(
+            "await {c}.insertMany([{{a:1}},{{a:2}},{{a:3}}]); print('batch 1 done'); \
+             await {c}.find({{ $where: 'sleep(2000) || true' }}); print('never')"
+        );
+        let started = Instant::now();
+        let out = run(
+            &inner,
+            "run_script",
+            json!({ "connection_id": "live", "database": TEST_DB, "script": script, "timeout_ms": "1500" }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.is_error);
+        assert!(
+            out.text.starts_with("The script was stopped after 1500 ms"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("batch 1 done"), "{}", out.text);
+        assert!(!out.text.contains("never"), "{}", out.text);
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        client
+            .database(TEST_DB)
+            .collection::<Document>(&coll)
+            .drop()
+            .await
+            .unwrap();
         inner.pool.close_all("test over").await;
     }
 

@@ -851,10 +851,32 @@ pub(crate) fn str_arg(args: &Value, key: &str) -> Option<String> {
 
 /// An integer argument clamped to `1..=max`.
 pub(crate) fn int_arg(args: &Value, key: &str, default: i64, max: i64) -> i64 {
-    args.get(key)
-        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-        .unwrap_or(default)
-        .clamp(1, max)
+    opt_int_arg(args, key).unwrap_or(default).clamp(1, max)
+}
+
+/// An integer argument, unclamped. Agents sometimes send numbers as JSON
+/// strings (`"120000"`), so those are read too: ignoring them silently
+/// fell back to the default.
+pub(crate) fn opt_int_arg(args: &Value, key: &str) -> Option<i64> {
+    match args.get(key)? {
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<i64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+        }
+        v => v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)),
+    }
+}
+
+/// A boolean argument, also read from `"true"`/`"false"` strings.
+pub(crate) fn bool_arg(args: &Value, key: &str) -> bool {
+    match args.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        Some(Value::Number(n)) => n.as_i64() == Some(1),
+        _ => false,
+    }
 }
 
 /// A JSON argument; agents sometimes send objects as JSON-encoded strings,

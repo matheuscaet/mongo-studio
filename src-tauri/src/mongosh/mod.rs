@@ -7,6 +7,8 @@ mod feed;
 mod install;
 mod script;
 
+pub(crate) use script::describe_ms;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;

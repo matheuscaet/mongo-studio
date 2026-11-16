@@ -407,7 +407,7 @@ pub async fn run(
     })
 }
 
-fn describe_ms(ms: u64) -> String {
+pub(crate) fn describe_ms(ms: u64) -> String {
     if ms.is_multiple_of(1000) {
         format!("{} s", ms / 1000)
     } else {
