@@ -25,18 +25,18 @@ ${header}
 // e.g. db.orders.find({}).limit(20).toArray();
 `;
   }
-  const header = `// db.collection("name") gives you find/findOne/insertOne/insertMany/updateOne/updateMany/deleteOne/deleteMany/aggregate/countDocuments.
-// Top-level await is supported; "use other_db" switches databases.`;
+  const header = `// db.<collection> (or db.getCollection("name")) has mongosh's find, aggregate, insert, update, delete,
+// distinct, bulkWrite... Await every call; "use other_db" switches databases.`;
   if (collection) {
     return `// Console for ${database}.${collection} - runs against the "${database}" database.
 ${header}
-const docs = await db.collection(${JSON.stringify(collection)}).find({}, { limit: 20 });
+const docs = await db.getCollection(${JSON.stringify(collection)}).find({}).limit(20).toArray();
 docs;
 `;
   }
   return `// Console for the "${database}" database - any of its collections.
 ${header}
-// e.g. await db.collection("orders").find({}, { limit: 20 });
+// e.g. await db.orders.find({}).limit(20).toArray();
 `;
 }
 

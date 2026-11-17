@@ -45,7 +45,7 @@ pub fn init_local_offset() {
         .get_or_init(|| time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
 }
 
-fn local_offset() -> time::UtcOffset {
+pub(crate) fn local_offset() -> time::UtcOffset {
     LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC)
 }
 
@@ -283,6 +283,10 @@ pub fn describe(err: &AppError, detail: Detail) -> String {
         (AppError::InvalidInput(_), Detail::NoUserData) => {
             "invalid input (details not logged)".to_string()
         }
+        (AppError::TimedOut(_), Detail::NoUserData) => "timed out".to_string(),
+        (AppError::WriteFailed(_), Detail::NoUserData) => {
+            "write error (details not logged)".to_string()
+        }
         _ => err.to_string(),
     };
     scrub_credentials(&text)
@@ -411,6 +415,7 @@ mod tests {
             id: "id".to_string(),
             name: "prod".to_string(),
             color: None,
+            environment: None,
             source,
             database: None,
             username: None,

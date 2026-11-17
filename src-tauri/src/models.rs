@@ -120,6 +120,38 @@ pub struct ConnectionAdvancedOptions {
     pub legacy_uuid: Option<LegacyUuidEncoding>,
 }
 
+/// What a connection is for. Set by the user; production makes the MCP
+/// server ask before any change a client makes on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Environment {
+    Development,
+    Testing,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    pub fn id(self) -> &'static str {
+        match self {
+            Environment::Development => "development",
+            Environment::Testing => "testing",
+            Environment::Staging => "staging",
+            Environment::Production => "production",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "development" | "dev" => Some(Environment::Development),
+            "testing" | "test" | "qa" => Some(Environment::Testing),
+            "staging" | "stage" | "beta" | "homologation" => Some(Environment::Staging),
+            "production" | "prod" => Some(Environment::Production),
+            _ => None,
+        }
+    }
+}
+
 /// Persisted, non-secret connection metadata. Lives in `connections.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +162,9 @@ pub struct ConnectionProfile {
     /// Defaulted so files saved before it existed still load.
     #[serde(default)]
     pub color: Option<String>,
+    /// Defaulted so files saved before it existed still load.
+    #[serde(default)]
+    pub environment: Option<Environment>,
     pub source: ConnectionSource,
     pub database: Option<String>,
     pub username: Option<String>,
@@ -152,6 +187,8 @@ pub struct ConnectionProfileInput {
     /// `#RRGGBB` or `None` for automatic; checked by `validate_color`.
     #[serde(default)]
     pub color: Option<String>,
+    #[serde(default)]
+    pub environment: Option<Environment>,
     pub source: ConnectionSource,
     pub database: Option<String>,
     pub username: Option<String>,
@@ -170,6 +207,7 @@ pub struct ConnectionProfileMeta {
     pub id: ConnectionId,
     pub name: String,
     pub color: Option<String>,
+    pub environment: Option<Environment>,
     pub summary: String,
     pub database: Option<String>,
     /// Whether a password is saved for it, for the export picker.
@@ -196,6 +234,7 @@ impl From<&ConnectionProfile> for ConnectionProfileMeta {
             id: profile.id.clone(),
             name: profile.name.clone(),
             color: profile.color.clone(),
+            environment: profile.environment,
             summary,
             database: profile.database.clone(),
             has_password: profile.has_password,

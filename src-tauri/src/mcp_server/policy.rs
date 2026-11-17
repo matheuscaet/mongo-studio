@@ -139,6 +139,12 @@ pub(crate) struct Request {
     pub title: String,
     pub code: String,
     pub dry_run: Option<String>,
+    /// Every connection a call on several is about; "always" is kept for
+    /// each of them.
+    pub connection_ids: Vec<String>,
+    /// On a production connection: the user is asked whatever the
+    /// settings say, and "always" isn't offered or kept.
+    pub production: bool,
 }
 
 #[derive(Serialize)]
@@ -156,6 +162,7 @@ struct RequestEvent<'a> {
     title: &'a str,
     code: &'a str,
     dry_run: Option<&'a str>,
+    production: bool,
     at: u64,
 }
 
@@ -203,6 +210,7 @@ pub(crate) async fn ask(inner: &Inner, client: &ClientSession, request: &Request
             title: &request.title,
             code: &request.code,
             dry_run: request.dry_run.as_deref(),
+            production: request.production,
             at: now_ms(),
         },
     );
@@ -217,9 +225,28 @@ pub(crate) async fn ask(inner: &Inner, client: &ClientSession, request: &Request
             request.title
         ),
     );
-    let answer = wait_for_answer(inner, request, &request_id, rx).await;
-    inner.dismiss_attention();
-    answer
+    let _withdraw = Withdraw {
+        inner,
+        request_id: &request_id,
+    };
+    wait_for_answer(inner, request, &request_id, rx).await
+}
+
+/// Takes the card away when the call stops waiting for any reason - also
+/// when it is dropped (the client cancelled its task).
+struct Withdraw<'a> {
+    inner: &'a Inner,
+    request_id: &'a str,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        let pending = self.inner.approvals.lock().unwrap().remove(self.request_id);
+        if pending.is_some() {
+            emit_closed(self.inner, self.request_id, "cancelled");
+        }
+        self.inner.dismiss_attention();
+    }
 }
 
 async fn wait_for_answer(
@@ -230,12 +257,20 @@ async fn wait_for_answer(
 ) -> Answer {
     match tokio::time::timeout(inner.ask_timeout, rx).await {
         Ok(Ok(RequestChoice::Once)) => Answer::Once,
+        // Production is asked about every time.
+        Ok(Ok(RequestChoice::Always)) if request.production => Answer::Once,
         Ok(Ok(RequestChoice::Always)) => {
-            let key = request
-                .connection_id
-                .clone()
-                .unwrap_or_else(|| ANY_CONNECTION.to_string());
-            remember_always(inner, &key, request.capability);
+            if request.connection_ids.is_empty() {
+                let key = request
+                    .connection_id
+                    .clone()
+                    .unwrap_or_else(|| ANY_CONNECTION.to_string());
+                remember_always(inner, &key, request.capability);
+            } else {
+                for id in &request.connection_ids {
+                    remember_always(inner, id, request.capability);
+                }
+            }
             Answer::Always
         }
         Ok(Ok(RequestChoice::Deny)) => Answer::Deny,
@@ -338,6 +373,8 @@ pub(crate) mod tests {
                 .collect(),
             always: HashMap::new(),
             alerts: Default::default(),
+            confirm_production: true,
+            history: true,
         }
     }
 
@@ -408,6 +445,8 @@ pub(crate) mod tests {
 
     fn request() -> Request {
         Request {
+            connection_ids: Vec::new(),
+            production: false,
             tool: "update_documents",
             capability: Cap::Write,
             connection_id: Some("c1".into()),

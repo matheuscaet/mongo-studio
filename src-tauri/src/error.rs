@@ -31,6 +31,20 @@ pub enum AppError {
     /// carries no prefix.
     #[error("{0}")]
     Assistant(String),
+    /// An operation ran past its time limit and was stopped. The message
+    /// says what happened and may quote what a script printed, so it
+    /// carries no prefix and isn't logged.
+    #[error("{0}")]
+    TimedOut(String),
+    /// Some writes of a batch failed: which ones, and what the others did.
+    /// Quotes the server's messages (a duplicate key's value), so it isn't
+    /// logged.
+    #[error("{0}")]
+    WriteFailed(String),
+    /// The connection to the server was lost or couldn't be made; the
+    /// message says what to check.
+    #[error("{0}")]
+    Network(String),
 }
 
 // Tauri serializes command errors as JSON for the frontend; a plain string

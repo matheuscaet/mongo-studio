@@ -178,6 +178,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             color: None,
+            environment: None,
             source,
             database: db.map(str::to_string),
             username: None,

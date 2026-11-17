@@ -7,7 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea";
 import { useConnectionsStore } from "@/store/connectionsStore";
 import { cn } from "@/lib/utils";
-import type { ConnectionSource } from "@/types/connection";
+import { ENVIRONMENT_LABELS, type ConnectionEnvironment, type ConnectionSource } from "@/types/connection";
 import { ColorSwatches } from "./ColorSwatches";
 import { DATA_FIELD, KEEP_SAVED, type ConnectionSectionProps } from "./connectionFormTypes";
 import { useFolderOptions } from "./connectionFolder";
@@ -17,6 +17,7 @@ import { ParsedUriChips } from "./ParsedUriChips";
 import { SectionTitle } from "./SectionTitle";
 
 const NO_FOLDER = "__root";
+const NO_ENVIRONMENT = "__none";
 
 interface GeneralSectionProps extends ConnectionSectionProps {
   folder: string | null;
@@ -78,6 +79,31 @@ export function GeneralSection({
           onChange={(color) => update("color", color)}
           autoColor={autoColor}
         />
+      </Field>
+
+      <Field
+        label="Environment"
+        htmlFor="conn-environment"
+        help="Shown next to its name. On Production, MCP clients have to ask before every change."
+      >
+        <Select
+          value={input.environment ?? NO_ENVIRONMENT}
+          onValueChange={(v) =>
+            update("environment", v === NO_ENVIRONMENT ? null : (v as ConnectionEnvironment))
+          }
+        >
+          <SelectTrigger id="conn-environment" className="w-full sm:w-[220px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={NO_ENVIRONMENT}>Not set</SelectItem>
+            {(Object.keys(ENVIRONMENT_LABELS) as ConnectionEnvironment[]).map((env) => (
+              <SelectItem key={env} value={env}>
+                {ENVIRONMENT_LABELS[env].name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </Field>
 
       <Field label="Connect with">

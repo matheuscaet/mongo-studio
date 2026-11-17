@@ -9,37 +9,46 @@
 //! the result; then the call runs on the server's own Mongo client for that
 //! connection. Every call is reported to the windows as an `mcp-activity`
 //! event. Logs name the tool, connection and namespace, never filters,
-//! documents or scripts.
+//! documents or scripts; those go only into the history the user keeps on
+//! this computer (`history`), when they keep one.
 
+mod documents;
+mod many;
 mod relations;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Document};
-use mongodb::options::IndexOptions;
+use mongodb::options::{Hint, IndexOptions};
 use mongodb::{Client, IndexModel};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use super::history::{self, HistoryEntry, HistoryFilter};
 use super::policy::{self, Answer, Cap, Decision, Request};
+use super::tasks::{self, Phase, Task};
 use super::{
     now_ms, ClientSession, Inner, Level, McpConfig, Policy, ACTIVITY_EVENT, CONNECTION_EVENT,
 };
 use crate::assistant::{
-    doc_arg, infer_schema, int_arg, opt_doc_arg, opt_json_arg, pipeline_writes, plural,
-    render_schema, str_arg, summarize_explain, thousands, truncate,
+    bool_arg, doc_arg, infer_schema, int_arg, opt_doc_arg, opt_int_arg, opt_json_arg,
+    pipeline_writes, plural, render_schema, str_arg, summarize_explain, thousands, truncate,
 };
 use crate::connection::extract_uri_credentials;
 use crate::ejson::{bson_to_json, document_to_json, json_to_document};
 use crate::error::{AppError, AppResult};
 use crate::logging::{self, Detail, Op};
-use crate::models::{ConnectionProfile, ConnectionSource};
+use crate::models::{ConnectionProfile, ConnectionSource, Environment};
+use crate::scripting::{ScriptExecutionResult, ScriptMode};
 use crate::state::CancelToken;
 
 /// Server-side limit on reads.
 const MAX_TIME: Duration = Duration::from_secs(30);
+/// max_time_ms of find, aggregate, count and explain.
+const DEFAULT_READ_MS: i64 = 30_000;
+const MAX_READ_MS: i64 = 10 * 60_000;
 /// Client-side backstop for one operation (scripts have their own timeout).
 const OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Tool output is cut here.
@@ -52,6 +61,14 @@ const MAX_DOCS: i64 = 100;
 const MAX_INSERT: usize = 1000;
 const DEFAULT_SCRIPT_MS: i64 = 30_000;
 const MAX_SCRIPT_MS: i64 = 300_000;
+const DEFAULT_TASK_WAIT_MS: i64 = 30_000;
+const DEFAULT_HISTORY: i64 = 20;
+const MAX_HISTORY: i64 = 200;
+const SCRIPT_READ_ONLY_HINT: &str = "You have read-only access to this connection in Mongo \
+Studio, and this script could write. Run it with read_only: true (writes are refused and stop \
+the script) or dry_run: true (writes are only counted).";
+/// Under the minute many clients wait for a request.
+const MAX_TASK_WAIT_MS: i64 = 45_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tool {
@@ -67,11 +84,13 @@ pub(crate) enum Tool {
     InsertDocuments,
     UpdateDocuments,
     DeleteDocuments,
+    UpsertDocuments,
     CreateCollection,
     DropCollection,
     CreateIndex,
     DropIndex,
     RunScript,
+    RunScriptOnConnections,
     CreateConnection,
     UpdateConnection,
     DeleteConnection,
@@ -84,6 +103,9 @@ pub(crate) enum Tool {
     TestRelation,
     FindRelated,
     DeleteRelation,
+    GetTask,
+    CancelTask,
+    GetHistory,
 }
 
 /// What a tool works on, and so which of connection_id, database and
@@ -97,7 +119,7 @@ enum Scope {
 }
 
 impl Tool {
-    const ALL: [Tool; 29] = [
+    const ALL: [Tool; 34] = [
         Tool::ListConnections,
         Tool::ListDatabases,
         Tool::ListCollections,
@@ -110,11 +132,13 @@ impl Tool {
         Tool::InsertDocuments,
         Tool::UpdateDocuments,
         Tool::DeleteDocuments,
+        Tool::UpsertDocuments,
         Tool::CreateCollection,
         Tool::DropCollection,
         Tool::CreateIndex,
         Tool::DropIndex,
         Tool::RunScript,
+        Tool::RunScriptOnConnections,
         Tool::CreateConnection,
         Tool::UpdateConnection,
         Tool::DeleteConnection,
@@ -127,6 +151,9 @@ impl Tool {
         Tool::TestRelation,
         Tool::FindRelated,
         Tool::DeleteRelation,
+        Tool::GetTask,
+        Tool::CancelTask,
+        Tool::GetHistory,
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -147,11 +174,13 @@ impl Tool {
             Tool::InsertDocuments => "insert_documents",
             Tool::UpdateDocuments => "update_documents",
             Tool::DeleteDocuments => "delete_documents",
+            Tool::UpsertDocuments => "upsert_documents",
             Tool::CreateCollection => "create_collection",
             Tool::DropCollection => "drop_collection",
             Tool::CreateIndex => "create_index",
             Tool::DropIndex => "drop_index",
             Tool::RunScript => "run_script",
+            Tool::RunScriptOnConnections => "run_script_on_connections",
             Tool::CreateConnection => "create_connection",
             Tool::UpdateConnection => "update_connection",
             Tool::DeleteConnection => "delete_connection",
@@ -164,6 +193,9 @@ impl Tool {
             Tool::TestRelation => "test_relation",
             Tool::FindRelated => "find_related",
             Tool::DeleteRelation => "delete_relation",
+            Tool::GetTask => "get_task",
+            Tool::CancelTask => "cancel_task",
+            Tool::GetHistory => "get_history",
         }
     }
 
@@ -172,17 +204,24 @@ impl Tool {
     /// and find_related also needs `read`, see `call`.
     fn cap(self) -> Cap {
         match self {
+            // About calls the client already made, each checked then.
+            Tool::GetTask | Tool::CancelTask => Cap::Browse,
+            // It shows what ran on the connections, scripts and filters included.
+            Tool::GetHistory => Cap::Read,
             Tool::ListConnections => Cap::ConnList,
             Tool::ListDatabases
             | Tool::ListCollections
             | Tool::ListIndexes
             | Tool::SampleSchema => Cap::Browse,
             Tool::Find | Tool::Aggregate | Tool::Count | Tool::Explain => Cap::Read,
-            Tool::InsertDocuments | Tool::UpdateDocuments | Tool::DeleteDocuments => Cap::Write,
+            Tool::InsertDocuments
+            | Tool::UpdateDocuments
+            | Tool::DeleteDocuments
+            | Tool::UpsertDocuments => Cap::Write,
             Tool::CreateCollection | Tool::DropCollection | Tool::CreateIndex | Tool::DropIndex => {
                 Cap::Ddl
             }
-            Tool::RunScript => Cap::Script,
+            Tool::RunScript | Tool::RunScriptOnConnections => Cap::Script,
             Tool::CreateConnection | Tool::UpdateConnection => Cap::ConnEdit,
             Tool::DeleteConnection => Cap::ConnDelete,
             Tool::SaveScript => Cap::SaveScript,
@@ -206,7 +245,12 @@ impl Tool {
             | Tool::SuggestRelationLinks
             | Tool::CreateRelation
             | Tool::UpdateRelation
-            | Tool::DeleteRelation => Scope::Nothing,
+            | Tool::DeleteRelation
+            | Tool::GetTask
+            | Tool::CancelTask
+            | Tool::GetHistory
+            // its connections are checked one by one, in `many`
+            | Tool::RunScriptOnConnections => Scope::Nothing,
             // The From (or source) connection; the other side's is resolved
             // from the relation and checked too.
             Tool::TestRelation | Tool::FindRelated => Scope::Connection,
@@ -233,7 +277,27 @@ impl Tool {
                 | Tool::CreateRelation
                 | Tool::UpdateRelation
                 | Tool::DeleteRelation
+                | Tool::GetTask
+                | Tool::CancelTask
+                | Tool::GetHistory
+                | Tool::RunScriptOnConnections
         )
+    }
+
+    /// Whether the call may change data or settings, so running it twice
+    /// would repeat the change.
+    fn changes_data(self, args: &Value) -> bool {
+        match self {
+            Tool::Aggregate => aggregate_writes(args),
+            Tool::RunScript | Tool::RunScriptOnConnections => {
+                script_mode(args) == ScriptMode::Normal
+            }
+            tool if documents::is_dry_run(tool, args) => false,
+            tool => !matches!(
+                tool.cap(),
+                Cap::Browse | Cap::Read | Cap::ConnList | Cap::RelRead
+            ),
+        }
     }
 
     fn is_relation_tool(self) -> bool {
@@ -282,8 +346,14 @@ fn all_definitions() -> Vec<Value> {
     let pipeline = json!({ "type": "array", "items": { "type": "object" }, "description": "Aggregation pipeline stages in Extended JSON." });
     let sort =
         json!({ "type": "object", "description": "Sort specification, e.g. {\"createdAt\": -1}." });
+    let max_time_ms = json!({ "type": "integer", "minimum": 1, "maximum": MAX_READ_MS, "default": DEFAULT_READ_MS, "description": "Server-side time limit in milliseconds (maxTimeMS). A call that outlasts about 40 seconds goes on in the background (see get_task)." });
+    // No "type": a list of types trips up some clients' schema checks.
+    let hint = json!({ "description": "Index to use: its name (see list_indexes) or key pattern, e.g. \"status_1_createdAt_-1\" or {\"status\": 1, \"createdAt\": -1}." });
+    let allow_disk_use = json!({ "type": "boolean", "default": false, "description": "Let large sorts and groups spill to disk (allowDiskUse)." });
     let read_only =
         json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
+    let dry_run = json!({ "type": "boolean", "default": false, "description": "Change nothing: report how many documents would change. Needs only read access." });
+    let environment = json!({ "type": "string", "enum": ["development", "testing", "staging", "production", "none"], "description": "What the connection is for. On production connections, the user is asked before every change. Only the user can take a connection out of production." });
     let writes = json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false });
     let destructive =
         json!({ "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false });
@@ -308,11 +378,17 @@ fn all_definitions() -> Vec<Value> {
         req.extend_from_slice(required);
         on_db(Value::Object(properties), &req)
     };
+    let script_props = json!({
+        "script": { "type": "string", "description": "The script, e.g. const n = await db.orders.countDocuments({ status: \"open\" }); n" },
+        "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS, "description": "The script is stopped (and the query it waits on) after this long; writes made before stay." },
+        "read_only": { "type": "boolean", "default": false, "description": "Refuse every write: the first one stops the script. Needs only read access to the connection." },
+        "dry_run": { "type": "boolean", "default": false, "description": "Don't write anything: each write is counted and reported (how many documents it would insert, change or delete) and gets a made-up result. Reads later in the script don't see those writes. Needs only read access." },
+    });
     // In `Tool::ALL` order.
     let mut defs = vec![
         json!({
             "name": "list_connections",
-            "description": "List the MongoDB connections saved in Mongo Studio that you may use: id, name, sidebar folder, hosts, default database and your access level (read or write). Start here: every other data tool takes a connection_id from this list. Passwords and full connection strings are never shown.",
+            "description": "List the MongoDB connections saved in Mongo Studio that you may use: id, name, sidebar folder, environment (development, testing, staging, production, or null when not set), hosts, replica set, default database and your access level (read or write). On production connections the user is asked before every change. Start here: every other data tool takes a connection_id from this list. Passwords and full connection strings are never shown.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": read_only,
         }),
@@ -351,6 +427,9 @@ fn all_definitions() -> Vec<Value> {
                 "sort": sort,
                 "skip": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DOCS, "default": DEFAULT_DOCS },
+                "hint": hint,
+                "max_time_ms": max_time_ms,
+                "allow_disk_use": allow_disk_use,
             }), &[]),
             "annotations": read_only,
         }),
@@ -360,26 +439,30 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": on_coll(json!({
                 "pipeline": pipeline,
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DOCS, "default": DEFAULT_DOCS, "description": "How many result documents to return." },
+                "hint": hint,
+                "max_time_ms": max_time_ms,
+                "allow_disk_use": allow_disk_use,
             }), &["pipeline"]),
             "annotations": read_only,
         }),
         json!({
             "name": "count",
             "description": "Count the documents matching a filter (exact count).",
-            "inputSchema": on_coll(json!({ "filter": filter }), &[]),
+            "inputSchema": on_coll(json!({ "filter": filter, "hint": hint, "max_time_ms": max_time_ms }), &[]),
             "annotations": read_only,
         }),
         json!({
             "name": "explain",
             "description": "Explain a find (filter and sort) or an aggregation pipeline with executionStats, and summarize the winning plan: stages, index used, keys and documents examined, documents returned, time.",
-            "inputSchema": on_coll(json!({ "filter": filter, "sort": sort, "pipeline": pipeline }), &[]),
+            "inputSchema": on_coll(json!({ "filter": filter, "sort": sort, "pipeline": pipeline, "hint": hint, "max_time_ms": max_time_ms, "allow_disk_use": allow_disk_use }), &[]),
             "annotations": read_only,
         }),
         json!({
             "name": "insert_documents",
             "description": "Insert documents (Extended JSON) into a collection. Needs write access; the user may have to approve it in Mongo Studio first.",
             "inputSchema": on_coll(json!({
-                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents to insert." }
+                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents to insert." },
+                "dry_run": { "type": "boolean", "default": false, "description": "Insert nothing: check the documents and report which would clash with an existing _id or a unique index. Needs only read access." },
             }), &["documents"]),
             "annotations": writes,
         }),
@@ -391,6 +474,7 @@ fn all_definitions() -> Vec<Value> {
                 "update": { "type": "object", "description": "Update document, e.g. {\"$set\": {\"status\": \"archived\"}}." },
                 "many": { "type": "boolean", "default": false, "description": "Update every matching document instead of the first." },
                 "upsert": { "type": "boolean", "default": false, "description": "Insert a document when none matches." },
+                "dry_run": dry_run.clone(),
             }), &["filter", "update"]),
             "annotations": destructive,
         }),
@@ -400,7 +484,19 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": on_coll(json!({
                 "filter": filter,
                 "many": { "type": "boolean", "default": false, "description": "Delete every matching document instead of the first." },
+                "dry_run": dry_run.clone(),
             }), &["filter"]),
+            "annotations": destructive,
+        }),
+        json!({
+            "name": "upsert_documents",
+            "description": "Insert or update many documents in one call, matching each by its key fields (like a bulkWrite of updateOne with upsert). A document whose keys match none is inserted; one that matches is updated with $set of its fields, or left as it is with only_insert ($setOnInsert). Reports how many already exist before anything changes. Needs write access; the user may have to approve it in Mongo Studio first.",
+            "inputSchema": on_coll(json!({
+                "keys": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The fields that identify a document, e.g. [\"subDomain\", \"product\"]. Every document must have them, and no two the same values." },
+                "documents": { "type": "array", "items": { "type": "object" }, "minItems": 1, "maxItems": MAX_INSERT, "description": "The documents, in Extended JSON." },
+                "only_insert": { "type": "boolean", "default": false, "description": "Insert the documents that don't exist yet and leave existing ones untouched." },
+                "dry_run": dry_run,
+            }), &["keys", "documents"]),
             "annotations": destructive,
         }),
         json!({
@@ -433,11 +529,26 @@ fn all_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "run_script",
-            "description": "Run JavaScript on a database with Mongo Studio's built-in engine (not full mongosh). It has db.getCollection(name) (or db.collection(name)) with find(filter, options), findOne, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate and countDocuments - each returns a promise, so await it - plus db.getSiblingDB(name), `use <db>` lines, print/console.log, ObjectId(hex) and ISODate(text). Returns the last expression's value as Extended JSON and what the script printed. Scripts can change data, so this needs write access, and the user may have to approve it first.",
-            "inputSchema": on_db(json!({
-                "script": { "type": "string", "description": "The script, e.g. const n = await db.getCollection(\"orders\").countDocuments({ status: \"open\" }); n" },
-                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": MAX_SCRIPT_MS, "default": DEFAULT_SCRIPT_MS },
-            }), &["script"]),
+            "description": "Run JavaScript on a database with Mongo Studio's built-in engine, which speaks most of mongosh's API with top-level await (not the full mongosh: await every call). It has db.<collection> and db.getCollection(name) with find(filter, projection, options) returning a cursor (sort, limit, skip, project, hint, maxTimeMS, allowDiskUse, collation, map, toArray, forEach, hasNext/next, for await), findOne, aggregate(pipeline, options) (a cursor too), countDocuments, estimatedDocumentCount, distinct, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne, deleteMany, findOneAndUpdate/Replace/Delete, bulkWrite, getIndexes, createIndex and drop, each taking the same options as in mongosh (an option the engine doesn't support is an error, never ignored); plus db.getName(), db.getSiblingDB(name), db.getCollectionNames(), db.runCommand(cmd), `use <db>` lines, print/printjson/console.log and `await sleep(ms)`. Dates (new Date(), ISODate()), ObjectId(), NumberLong(), NumberInt(), NumberDecimal(), UUID() and regexes are stored as their BSON types and come back as such. `await cursor` without toArray() returns at most 1000 documents. Returns the last expression's value as relaxed Extended JSON, what the script printed, and what its writes changed. A script that writes needs write access and may need the user's approval; with read_only it needs only read access and any write stops it, and with dry_run no write is made: each is counted (how many documents it would touch) and reported instead. A call that runs past about 40 seconds goes on in the background (see get_task).",
+            "inputSchema": on_db(script_props.clone(), &["script"]),
+            "annotations": destructive,
+        }),
+        json!({
+            "name": "run_script_on_connections",
+            "description": "Run the same script on several connections, one after the other, and get each one's result, what it printed and what it changed - e.g. the same fix on every tenant's cluster. Same engine and arguments as run_script, with connection_ids instead of connection_id; the database must have the same name on each. When the user has to approve it, they are asked once for all the connections. A failure on one connection doesn't stop the others unless stop_on_error is true; timeout_ms applies to each connection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "connection_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 20, "description": "Ids of saved connections, from list_connections." },
+                    "database": database.clone(),
+                    "script": script_props["script"].clone(),
+                    "timeout_ms": script_props["timeout_ms"].clone(),
+                    "read_only": script_props["read_only"].clone(),
+                    "dry_run": script_props["dry_run"].clone(),
+                    "stop_on_error": { "type": "boolean", "default": false, "description": "Don't run on the connections after the first failure." },
+                },
+                "required": ["connection_ids", "database", "script"],
+            },
             "annotations": destructive,
         }),
         json!({
@@ -449,6 +560,7 @@ fn all_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "Name shown in Mongo Studio's sidebar." },
                     "uri": { "type": "string", "description": "mongodb:// or mongodb+srv:// connection string, preferably without a password." },
                     "folder": { "type": "string", "description": "Name of an existing sidebar folder to put it in." },
+                    "environment": environment.clone(),
                 },
                 "required": ["name", "uri"],
             },
@@ -463,6 +575,7 @@ fn all_definitions() -> Vec<Value> {
                     "connection_id": connection_id,
                     "name": { "type": "string", "description": "New name." },
                     "uri": { "type": "string", "description": "New mongodb:// or mongodb+srv:// connection string." },
+                    "environment": environment,
                 },
                 "required": ["connection_id"],
             },
@@ -490,9 +603,45 @@ fn all_definitions() -> Vec<Value> {
         }),
     ];
     defs.extend(relations::definitions());
+    let task_id = json!({ "type": "string", "description": "The task_id a call answered with when it went on in the background." });
+    defs.push(json!({
+        "name": "get_task",
+        "description": "Follow a call that went on in the background: a call that takes more than about 40 seconds (waiting for the user's approval, or a long script or query) answers with a task_id instead of its result. This waits up to wait_ms for it to end and returns its result, or else its status and the lines it printed so far.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": task_id,
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_TASK_WAIT_MS, "default": DEFAULT_TASK_WAIT_MS, "description": "How long to wait for the task to end before answering with its status." },
+                "from_line": { "type": "integer", "minimum": 0, "default": 0, "description": "Show printed lines from this index on (the previous status says which to pass)." },
+            },
+            "required": ["task_id"],
+        },
+        "annotations": read_only,
+    }));
+    defs.push(json!({
+        "name": "cancel_task",
+        "description": "Stop a call that went on in the background: withdraws a request still waiting for the user's approval, or stops a running script or query. Changes already made are kept.",
+        "inputSchema": { "type": "object", "properties": { "task_id": task_id }, "required": ["task_id"] },
+        "annotations": writes,
+    }));
+    defs.push(json!({
+        "name": "get_history",
+        "description": "What MCP clients changed through Mongo Studio, newest first, as kept on this computer when the user keeps a history: every write, schema change, connection edit and script that ran, with its code, time, connection and environment, who approved it, and what it changed or why it failed. Markdown is ready to paste into a ticket or pull request. Only connections you may read are shown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connection_id": { "type": "string", "description": "Only this connection's entries." },
+                "since": { "type": "string", "description": "Only entries from then on: a date (2026-11-16) or an ISO date-time." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_HISTORY, "default": DEFAULT_HISTORY },
+                "format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" },
+            },
+        },
+        "annotations": read_only,
+    }));
     defs
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct ToolOutput {
     pub text: String,
     pub is_error: bool,
@@ -507,6 +656,11 @@ struct Target {
     collection: Option<String>,
     /// Shown instead of the namespace, e.g. a relation's name.
     label: Option<String>,
+    /// A call on several connections: their names and ids, and their
+    /// environments, for the history.
+    names: Option<String>,
+    ids: Vec<String>,
+    environments: Option<String>,
 }
 
 impl Target {
@@ -574,11 +728,18 @@ struct Call<'a> {
     tool: Tool,
     target: Target,
     started: Instant,
+    /// Followed by get_task when the call outlasts `inline_wait`.
+    task: Arc<Task>,
+    /// A read that lost its connection and ran again.
+    retried: bool,
+    /// What runs, as the approval card shows it, for the history.
+    code: Option<String>,
 }
 
 impl Call<'_> {
     /// Reports the call to the windows and the log, and builds the output.
     fn finish(&self, result: &str, label: String, meta: String, text: String) -> ToolOutput {
+        self.record(result, &label, &meta, &text);
         self.inner.emit(
             ACTIVITY_EVENT,
             &ActivityEvent {
@@ -595,6 +756,44 @@ impl Call<'_> {
         ToolOutput {
             text: truncate(text, MAX_OUTPUT),
             is_error: result != "ok",
+        }
+    }
+
+    /// Keeps a call that ran and could change something - and every
+    /// script - in the history, when the user keeps one.
+    fn record(&self, result: &str, label: &str, meta: &str, text: &str) {
+        let script = matches!(self.tool, Tool::RunScript | Tool::RunScriptOnConnections);
+        if self.task.phase() != Phase::Running || !(self.task.changes_data || script) {
+            return;
+        }
+        if !self.inner.config().history {
+            return;
+        }
+        let profile = self.target.profile.as_ref();
+        let failed = result != "ok";
+        let entry = HistoryEntry {
+            at: now_ms(),
+            client: self.client.name.clone(),
+            tool: self.tool.name().to_string(),
+            connection_id: self.target.connection_id.clone(),
+            connection_ids: self.target.ids.clone(),
+            connection_name: profile
+                .map(|p| p.name.clone())
+                .or_else(|| self.target.names.clone()),
+            environment: profile
+                .and_then(|p| p.environment)
+                .map(|e| e.id().to_string())
+                .or_else(|| self.target.environments.clone()),
+            target: self.target.text(),
+            code: self.code.clone().unwrap_or_default(),
+            outcome: if failed { "error" } else { "ok" }.to_string(),
+            summary: meta.to_string(),
+            error: failed.then(|| logging::scrub_credentials(text)),
+            approval: label.split(" · ").next().unwrap_or(label).to_string(),
+            duration_ms: self.started.elapsed().as_millis() as u64,
+        };
+        if let Err(e) = self.inner.history.append(entry) {
+            log::warn!("MCP server: couldn't add to the history: {e}");
         }
     }
 
@@ -617,12 +816,44 @@ impl Call<'_> {
         );
     }
 
+    /// A lost connection, told as one: what to check, whether the call
+    /// was retried, and that a write may or may not have been applied. The
+    /// connection's client is dropped, so the next call connects afresh
+    /// (and opens a new SSH tunnel).
+    fn network_error(&self, error: AppError) -> AppError {
+        let Some(profile) = &self.target.profile else {
+            return error;
+        };
+        if !lost_connection(&error) {
+            return error;
+        }
+        let inner = self.inner.clone();
+        let id = profile.id.clone();
+        tokio::spawn(async move { inner.pool.close(&id, "the connection was lost").await });
+        let original = logging::scrub_credentials(&error.to_string());
+        let mut text = format!(
+            "Lost the connection to \"{}\" ({original}). Check the VPN or the network{} and try again.",
+            profile.name,
+            if profile.ssh_tunnel.is_some() { ", and the SSH server" } else { "" },
+        );
+        if self.retried {
+            text.push_str(" The call was retried once after reconnecting, and failed again.");
+        } else if self.task.changes_data && self.task.phase() == Phase::Running {
+            text.push_str(
+                " It changes data, so it wasn't retried: check whether it was applied before \
+                 running it again.",
+            );
+        }
+        AppError::Network(text)
+    }
+
     fn refuse(&self, label: &str, text: &str) -> ToolOutput {
         self.log(label);
         self.finish("warn", label.to_string(), String::new(), text.to_string())
     }
 
     fn fail(&self, error: AppError) -> ToolOutput {
+        let error = self.network_error(error);
         self.log(&format!(
             "failed: {}",
             logging::describe(&error, Detail::NoUserData)
@@ -644,14 +875,35 @@ pub(crate) async fn call(
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
     };
-    let mut call = Call {
-        inner,
-        client,
-        tool,
-        target: Target::default(),
-        started: Instant::now(),
+    let task_id = str_arg(&args, "task_id").unwrap_or_default();
+    match tool {
+        Tool::GetTask => {
+            let wait = opt_int_arg(&args, "wait_ms")
+                .unwrap_or(DEFAULT_TASK_WAIT_MS)
+                .clamp(0, MAX_TASK_WAIT_MS);
+            let from_line = opt_int_arg(&args, "from_line").unwrap_or(0).max(0) as usize;
+            let wait = Duration::from_millis(wait as u64);
+            return Some(tasks::get(inner, &task_id, wait, from_line).await);
+        }
+        Tool::CancelTask => return Some(tasks::cancel(inner, &task_id)),
+        _ => {}
+    }
+    let task = Task::new(&client.id, tool.name(), tool.changes_data(&args));
+    let (owned_inner, owned_client, followed) = (inner.clone(), client.clone(), task.clone());
+    let work = async move {
+        let mut call = Call {
+            inner: &owned_inner,
+            client: &owned_client,
+            tool,
+            target: Target::default(),
+            started: Instant::now(),
+            task: followed,
+            retried: false,
+            code: None,
+        };
+        run_call(&mut call, &args).await
     };
-    Some(run_call(&mut call, &args).await)
+    Some(tasks::run(inner, task, work).await)
 }
 
 async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
@@ -680,21 +932,29 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
     }
 
+    if tool == Tool::RunScriptOnConnections {
+        return many::run(call, args).await;
+    }
+
     let config = call.inner.config();
     let cap = match tool {
         Tool::Aggregate if aggregate_writes(args) => Cap::Write,
+        // A dry run only reads.
+        _ if documents::is_dry_run(tool, args) => Cap::Read,
         Tool::TestRelation if policy::cap_policy(&config, Cap::RelRead) == Policy::Off => {
             Cap::RelEdit
         }
         _ => tool.cap(),
     };
+    // A script that can't write needs only read access.
+    let script_reads = tool == Tool::RunScript && script_mode(args) != ScriptMode::Normal;
     let decide = |cap: Cap| {
-        policy::decide(
-            &config,
-            cap,
-            call.target.connection_id.as_deref(),
-            level_needed(cap),
-        )
+        let need = if script_reads {
+            Level::Read
+        } else {
+            level_needed(cap)
+        };
+        policy::decide(&config, cap, call.target.connection_id.as_deref(), need)
     };
     let (cap, decision) = match tool {
         // Joining returns documents: `read` must allow it as well.
@@ -703,7 +963,19 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
     };
     match decision {
         Decision::Off => return call.refuse("Refused: turned off", policy::REFUSED_OFF),
-        Decision::NoAccess => return call.refuse("Refused: no access", policy::REFUSED_NO_ACCESS),
+        Decision::NoAccess => {
+            let reads = call
+                .target
+                .connection_id
+                .as_deref()
+                .is_some_and(|id| policy::level_of(&config, id) == Level::Read);
+            let text = if tool == Tool::RunScript && reads {
+                SCRIPT_READ_ONLY_HINT
+            } else {
+                policy::REFUSED_NO_ACCESS
+            };
+            return call.refuse("Refused: no access", text);
+        }
         Decision::Ask | Decision::Allow | Decision::AllowAlways => {}
     }
 
@@ -717,6 +989,18 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
             }
         }
     }
+
+    // On production, every change is asked about.
+    let production = call
+        .target
+        .profile
+        .as_ref()
+        .is_some_and(|p| p.environment == Some(Environment::Production));
+    let guarded = production && config.confirm_production && call.task.changes_data;
+    let decision = match decision {
+        Decision::Allow | Decision::AllowAlways if guarded => Decision::Ask,
+        other => other,
+    };
 
     if tool.is_relation_tool() {
         match relations::prepare(call, args) {
@@ -747,11 +1031,13 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         Ok(plan) => plan,
         Err(e) => return call.fail(e),
     };
+    call.code = Some(plan.code.clone());
 
     let label = match decision {
         Decision::Allow => "Allowed",
         Decision::AllowAlways => "Allowed (always)",
         _ => {
+            call.task.set_phase(Phase::Approval);
             let request = Request {
                 tool: tool.name(),
                 capability: cap,
@@ -762,6 +1048,8 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
                 title: plan.title.clone(),
                 code: truncate(plan.code.clone(), MAX_CODE),
                 dry_run: plan.dry_run.clone(),
+                connection_ids: Vec::new(),
+                production: guarded,
             };
             match policy::ask(call.inner, call.client, &request).await {
                 Answer::Once => "Approved by you",
@@ -773,19 +1061,45 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
     };
 
+    call.task.set_phase(Phase::Running);
     let timeout = match tool {
         Tool::RunScript => {
             Duration::from_millis(script_timeout(args) as u64) + Duration::from_secs(30)
         }
+        Tool::Find | Tool::Aggregate | Tool::Count | Tool::Explain => {
+            OP_TIMEOUT.max(read_time(args) + Duration::from_secs(30))
+        }
         _ => OP_TIMEOUT,
     };
-    let result = tokio::time::timeout(timeout, execute(call, args, mongo.as_ref(), &plan))
+    let timed_out = || {
+        Err(AppError::InvalidInput(
+            "The operation timed out.".to_string(),
+        ))
+    };
+    let mut result = tokio::time::timeout(timeout, execute(call, args, mongo.as_ref(), &plan))
         .await
-        .unwrap_or_else(|_| {
-            Err(AppError::InvalidInput(
-                "The operation timed out.".to_string(),
-            ))
-        });
+        .unwrap_or_else(|_| timed_out());
+    // A read that lost its connection runs once more on a fresh one.
+    let lost = matches!(&result, Err(e) if lost_connection(e));
+    if lost && tool.uses_mongo() && !tool.changes_data(args) {
+        let profile = call.target.profile.clone().expect("checked above");
+        call.inner
+            .pool
+            .close(&profile.id, "the connection was lost")
+            .await;
+        call.retried = true;
+        log::info!("MCP: {} lost its connection; retrying once", tool.name());
+        if let Ok(fresh) = call
+            .inner
+            .pool
+            .client(call.inner.host.as_ref(), &profile)
+            .await
+        {
+            result = tokio::time::timeout(timeout, execute(call, args, Some(&fresh), &plan))
+                .await
+                .unwrap_or_else(|_| timed_out());
+        }
+    }
     match result {
         Ok(done) => {
             call.log(label);
@@ -793,6 +1107,62 @@ async fn run_call(call: &mut Call<'_>, args: &Value) -> ToolOutput {
         }
         Err(e) => call.fail(e),
     }
+}
+
+/// Whether an error says the connection to the server was lost or
+/// couldn't be made: a reset (os error 10054 on Windows, 104 on Linux), a
+/// timeout, no reachable server, a dead SSH tunnel. Script errors arrive as
+/// text, so the text is read too.
+pub(crate) fn lost_connection(error: &AppError) -> bool {
+    use mongodb::error::ErrorKind;
+    match error {
+        AppError::Mongo(e) => {
+            matches!(
+                e.kind.as_ref(),
+                ErrorKind::Io(_)
+                    | ErrorKind::ConnectionPoolCleared { .. }
+                    | ErrorKind::ServerSelection { .. }
+            ) || e.contains_label("NetworkError")
+        }
+        AppError::Io(_) | AppError::Ssh(_) | AppError::Network(_) => true,
+        AppError::InvalidInput(text) => says_network(text),
+        _ => false,
+    }
+}
+
+fn says_network(text: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "os error 10050",
+        "os error 10051",
+        "os error 10053",
+        "os error 10054",
+        "os error 10060",
+        "os error 10061",
+        "os error 10065",
+        "os error 32)",
+        "os error 101)",
+        "os error 103)",
+        "os error 104)",
+        "os error 110)",
+        "os error 111)",
+        "os error 113)",
+        "connection reset",
+        "broken pipe",
+        "connection refused",
+        "connection aborted",
+        "network is unreachable",
+        "host is unreachable",
+        "server selection timeout",
+        "no available servers",
+        "connection pool for",
+    ];
+    let text = text.to_ascii_lowercase();
+    // Only the driver's own errors, as a script passes them on: a script
+    // that throws "connection refused" itself isn't a lost connection.
+    let from_driver = text.contains("database error:")
+        || text.contains("ssh tunnel error:")
+        || text.contains("server selection timeout");
+    from_driver && SIGNS.iter().any(|sign| text.contains(sign))
 }
 
 /// The stricter of two decisions, with its capability: off, then no
@@ -824,6 +1194,207 @@ fn script_timeout(args: &Value) -> i64 {
     int_arg(args, "timeout_ms", DEFAULT_SCRIPT_MS, MAX_SCRIPT_MS).max(1000)
 }
 
+/// Cancels its token when dropped.
+struct CancelOnDrop(CancelToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// A script stopped at its time limit: what it printed until then, which
+/// tells how far it got.
+fn script_timed_out(timeout_ms: u64, printed: &[String]) -> AppError {
+    let mut text = format!(
+        "The script was stopped after {} (timeout_ms = {timeout_ms}). Writes it made before \
+         that were kept. Raise timeout_ms (up to {MAX_SCRIPT_MS}) or split the work.",
+        crate::mongosh::describe_ms(timeout_ms)
+    );
+    if printed.is_empty() {
+        text.push_str("\nIt printed nothing before it stopped.");
+    } else {
+        text.push_str(&format!(
+            "\nPrinted before it stopped:\n{}",
+            printed.join("\n")
+        ));
+    }
+    AppError::TimedOut(text)
+}
+
+/// How run_script treats writes, from its arguments.
+fn script_mode(args: &Value) -> ScriptMode {
+    if bool_of(args, "dry_run") {
+        ScriptMode::DryRun
+    } else if bool_of(args, "read_only") {
+        ScriptMode::ReadOnly
+    } else {
+        ScriptMode::Normal
+    }
+}
+
+/// A script that ran to its end.
+struct ScriptRan {
+    result: ScriptExecutionResult,
+    mode: ScriptMode,
+}
+
+impl ScriptRan {
+    fn text(&self, db: &str) -> String {
+        let r = &self.result;
+        let mut text = match self.mode {
+            ScriptMode::DryRun => format!("Dry run on {db}: nothing was written."),
+            ScriptMode::ReadOnly => format!("The script ran read-only on {db}."),
+            ScriptMode::Normal => format!("The script ran on {db}."),
+        };
+        if r.database != db {
+            text.push_str(&format!(" (db is now {}.)", r.database));
+        }
+        match self.mode {
+            ScriptMode::DryRun if r.planned.is_empty() => text.push_str(" It made no writes."),
+            ScriptMode::DryRun => text.push_str(&format!(
+                " Its writes would have done this (later reads in the script don't see them):\n- {}",
+                r.planned.join("\n- ")
+            )),
+            _ if !r.writes.is_empty() => {
+                text.push_str(&format!("\nChanged: {}.", r.writes.summary()))
+            }
+            _ => {}
+        }
+        text.push_str(&format!(
+            "\nResult (relaxed Extended JSON):\n{}",
+            serde_json::to_string_pretty(&r.value).unwrap_or_default()
+        ));
+        if !r.logs.is_empty() {
+            text.push_str(&format!("\nPrinted:\n{}", r.logs.join("\n")));
+        }
+        text
+    }
+
+    fn meta(&self) -> String {
+        let r = &self.result;
+        let printed = plural(r.logs.len() as u64, "line", "lines");
+        match self.mode {
+            ScriptMode::DryRun => format!("dry run · {} writes · {printed}", r.planned.len()),
+            _ if !r.writes.is_empty() => format!("{} · {printed}", r.writes.summary()),
+            _ => format!("{printed} printed"),
+        }
+    }
+}
+
+/// What a run_script call came to, with what it printed either way.
+struct ScriptOutcome {
+    result: AppResult<ScriptRan>,
+}
+
+/// Runs run_script's script on one connection's `client`, within
+/// timeout_ms. `prefix` marks the lines it prints in the task's output
+/// when several connections run it.
+async fn run_script(
+    call: &Call<'_>,
+    client: &Client,
+    db: &str,
+    args: &Value,
+    prefix: Option<String>,
+) -> ScriptOutcome {
+    let script = match script_of(args) {
+        Ok(script) => script,
+        Err(e) => return ScriptOutcome { result: Err(e) },
+    };
+    let mode = script_mode(args);
+    let timeout = script_timeout(args) as u64;
+    let printed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = printed.clone();
+    let task = call.task.clone();
+    // Stops the script, and the query it waits on, when the call ends
+    // early: past timeout_ms, or dropped.
+    let stop = CancelOnDrop(CancelToken::default());
+    let run = crate::scripting::run_script_in(
+        client.clone(),
+        db.to_string(),
+        script,
+        // The engine's own limit only interrupts JavaScript; the one below
+        // also stops a query in flight.
+        Some(timeout + 5_000),
+        mode,
+        stop.0.clone(),
+        move |line: String| {
+            match &prefix {
+                Some(p) => task.print(format!("[{p}] {line}")),
+                None => task.print(line.clone()),
+            }
+            sink.lock().unwrap().push(line);
+        },
+    );
+    let result = tokio::select! {
+        result = run => result.map(|result| ScriptRan { result, mode }),
+        () = tokio::time::sleep(Duration::from_millis(timeout)) => {
+            stop.0.cancel();
+            let printed = printed.lock().unwrap();
+            Err(script_timed_out(timeout, &printed))
+        }
+    };
+    ScriptOutcome { result }
+}
+
+/// `.hint(...).maxTimeMS(...).allowDiskUse()` for a find's approval card.
+fn read_options_code(args: &Value) -> AppResult<String> {
+    let mut code = String::new();
+    if let Some(hint) = hint_of(args)? {
+        code.push_str(&format!(".hint({})", bson_to_json(hint_bson(hint))));
+    }
+    if args.get("max_time_ms").is_some() {
+        code.push_str(&format!(".maxTimeMS({})", read_time(args).as_millis()));
+    }
+    if bool_of(args, "allow_disk_use") {
+        code.push_str(".allowDiskUse()");
+    }
+    Ok(code)
+}
+
+/// max_time_ms of a read: 30 s unless the call says otherwise.
+fn read_time(args: &Value) -> Duration {
+    Duration::from_millis(int_arg(args, "max_time_ms", DEFAULT_READ_MS, MAX_READ_MS) as u64)
+}
+
+/// `hint`: an index name, or a key pattern (also as a JSON string).
+fn hint_of(args: &Value) -> AppResult<Option<Hint>> {
+    match args.get("hint") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) if s.trim_start().starts_with('{') => {
+            let keys = serde_json::from_str::<Value>(s)
+                .map_err(|e| invalid(format!("hint is not valid JSON: {e}")))?;
+            Ok(Some(Hint::Keys(json_to_document(keys)?)))
+        }
+        Some(Value::String(name)) => Ok(Some(Hint::Name(name.trim().to_string()))),
+        Some(keys @ Value::Object(_)) => Ok(Some(Hint::Keys(json_to_document(keys.clone())?))),
+        Some(_) => Err(invalid(
+            "hint must be an index name or a key pattern object.",
+        )),
+    }
+}
+
+fn hint_bson(hint: Hint) -> mongodb::bson::Bson {
+    match hint {
+        Hint::Keys(keys) => keys.into(),
+        Hint::Name(name) => name.into(),
+        _ => mongodb::bson::Bson::Null,
+    }
+}
+
+/// Applies an optional setting to a driver action.
+trait Optional: Sized {
+    fn optional<T>(self, value: Option<T>, apply: impl FnOnce(Self, T) -> Self) -> Self {
+        match value {
+            Some(value) => apply(self, value),
+            None => self,
+        }
+    }
+}
+
+impl<T> Optional for T {}
+
 fn doc_of(args: &Value, key: &str) -> AppResult<Document> {
     doc_arg(args, key).map_err(AppError::InvalidInput)
 }
@@ -837,7 +1408,12 @@ fn json_of(args: &Value, key: &str) -> AppResult<Option<Value>> {
 }
 
 fn bool_of(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+    bool_arg(args, key)
+}
+
+/// `skip`: a count of documents, 0 when absent or negative.
+fn skip_of(args: &Value) -> u64 {
+    opt_int_arg(args, "skip").unwrap_or(0).max(0) as u64
 }
 
 fn pipeline_of(args: &Value) -> AppResult<Vec<Value>> {
@@ -974,18 +1550,39 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
             if let Some(sort) = json_of(args, "sort")? {
                 statement.push_str(&format!(".sort({})", js(&sort)));
             }
-            let skip = args.get("skip").and_then(Value::as_i64).unwrap_or(0);
+            let skip = skip_of(args);
             if skip > 0 {
                 statement.push_str(&format!(".skip({skip})"));
             }
             let limit = int_arg(args, "limit", DEFAULT_DOCS, MAX_DOCS);
             statement.push_str(&format!(".limit({limit})"));
+            statement.push_str(&read_options_code(args)?);
             plan(format!("find on {ns}"), on_coll(statement))
         }
         Tool::Aggregate => {
             let stages = pipeline_of(args)?;
             let writes = pipeline_writes(&stages);
-            let code = on_coll(format!("aggregate({})", js(&Value::Array(stages.clone()))));
+            let mut options = Map::new();
+            if let Some(hint) = hint_of(args)? {
+                options.insert("hint".into(), bson_to_json(hint_bson(hint)));
+            }
+            if args.get("max_time_ms").is_some() {
+                options.insert(
+                    "maxTimeMS".into(),
+                    json!(read_time(args).as_millis() as u64),
+                );
+            }
+            if bool_of(args, "allow_disk_use") {
+                options.insert("allowDiskUse".into(), json!(true));
+            }
+            let options = match options.is_empty() {
+                true => String::new(),
+                false => format!(", {}", js(&Value::Object(options))),
+            };
+            let code = on_coll(format!(
+                "aggregate({}{options})",
+                js(&Value::Array(stages.clone()))
+            ));
             stages_of(stages)?;
             let title = if writes {
                 format!("aggregate with $out/$merge on {ns}")
@@ -1069,6 +1666,25 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
                 dry_run: Some(dry_run_text(DryRun::Update { matched, upsert })),
             }
         }
+        Tool::UpsertDocuments => {
+            let upsert = documents::upsert_args(args)?;
+            let mongo = mongo.expect("upsert_documents uses mongo");
+            let existing = upsert.existing(mongo, db, coll).await?;
+            let n = upsert.docs.len() as u64;
+            Plan {
+                title: format!(
+                    "Upsert {} on {ns}{}",
+                    plural(n, "document", "documents"),
+                    if upsert.only_insert {
+                        " (only insert)"
+                    } else {
+                        ""
+                    }
+                ),
+                code: on_coll(upsert.code()),
+                dry_run: Some(upsert.dry_run_text(existing)),
+            }
+        }
         Tool::DeleteDocuments => {
             let filter = doc_of(args, "filter")?;
             let many = bool_of(args, "many");
@@ -1131,7 +1747,12 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
         }
         Tool::RunScript => {
             let script = script_of(args)?;
-            plan(format!("Run a script on {db}"), code_on(db, None, &script))
+            let title = match script_mode(args) {
+                ScriptMode::Normal => format!("Run a script on {db}"),
+                ScriptMode::ReadOnly => format!("Run a read-only script on {db}"),
+                ScriptMode::DryRun => format!("Dry-run a script on {db} (nothing is written)"),
+            };
+            plan(title, code_on(db, None, &script))
         }
         Tool::CreateConnection => {
             let new = new_connection_args(args)?;
@@ -1139,16 +1760,25 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
             if let Some(folder) = &new.folder {
                 code.push_str(&format!("\nfolder: {folder}"));
             }
+            if let Some(environment) = new.environment {
+                code.push_str(&format!("\nenvironment: {}", environment.id()));
+            }
             plan(format!("Save a new connection \"{}\"", new.name), code)
         }
         Tool::UpdateConnection => {
             let change = connection_change_args(args)?;
+            let current = t.profile.as_ref().and_then(|p| p.environment);
+            check_environment_change(current, change.environment)?;
             let mut code = String::new();
             if let Some(name) = &change.name {
                 code.push_str(&format!("name: {name}\n"));
             }
             if let Some(uri) = &change.uri {
                 code.push_str(&format!("uri: {uri}\n"));
+            }
+            if let Some(environment) = change.environment {
+                let id = environment.map_or("none", Environment::id);
+                code.push_str(&format!("environment: {id}\n"));
             }
             plan(
                 format!("Edit the connection \"{}\"", t.connection_name()),
@@ -1166,11 +1796,21 @@ async fn plan(call: &Call<'_>, args: &Value, mongo: Option<&Client>) -> AppResul
                 ),
             )
         }
+        Tool::GetHistory => plan(
+            "Read the history of changes".to_string(),
+            "get_history".to_string(),
+        ),
         Tool::SaveScript => {
             let (name, content) = script_save_args(args)?;
             plan(format!("Save the script \"{name}\""), content)
         }
         _ => relations::plan(call, args)?,
+    })
+    .map(|mut plan| {
+        if documents::is_dry_run(call.tool, args) {
+            plan.title = format!("Dry run of {}", plan.title);
+        }
+        plan
     })
 }
 
@@ -1236,9 +1876,13 @@ async fn execute(
         Tool::UpdateConnection => update_connection(call, args).await,
         Tool::DeleteConnection => delete_connection(call).await,
         Tool::SaveScript => save_script(call, args),
+        Tool::GetHistory => get_history(call, args),
         tool if tool.is_relation_tool() => relations::execute(call, args, mongo).await,
         _ => {
             let client = mongo.expect("data tools have a client");
+            if documents::is_dry_run(call.tool, args) {
+                return dry_run_only(client, db, coll, args, call.tool, plan).await;
+            }
             match call.tool {
                 Tool::ListDatabases => {
                     let dbs = timed!(async {
@@ -1297,7 +1941,8 @@ async fn execute(
                     let n = timed!(async {
                         Ok(collection(client, db, coll)
                             .count_documents(filter)
-                            .max_time(MAX_TIME)
+                            .max_time(read_time(args))
+                            .optional(hint_of(args)?, |c, h| c.hint(h))
                             .await?)
                     })
                     .await?;
@@ -1354,6 +1999,37 @@ async fn execute(
                         meta: format!(
                             "{} modified",
                             plural(result.modified_count, "document", "documents")
+                        ),
+                    })
+                }
+                Tool::UpsertDocuments => {
+                    let upsert = documents::upsert_args(args)?;
+                    let result = timed!(crate::bulk::bulk_write(
+                        client,
+                        db,
+                        coll,
+                        upsert.ops(),
+                        false,
+                        None,
+                    ))
+                    .await?;
+                    let inserted = plural(result.upserted, "document", "documents");
+                    let text = if upsert.only_insert {
+                        format!(
+                            "{dry}Inserted {inserted} into {ns}; {} already existed and were left as they were.",
+                            result.matched
+                        )
+                    } else {
+                        format!(
+                            "{dry}Upserted into {ns}: inserted {inserted}, matched {} (modified {}).",
+                            result.matched, result.modified
+                        )
+                    };
+                    Ok(Done {
+                        text,
+                        meta: format!(
+                            "{} inserted · {} modified",
+                            result.upserted, result.modified
                         ),
                     })
                 }
@@ -1420,37 +2096,50 @@ async fn execute(
                     })
                 }
                 Tool::RunScript => {
-                    let script = script_of(args)?;
-                    let timeout = script_timeout(args) as u64;
-                    let result = timed!(crate::scripting::run_script(
-                        client.clone(),
-                        db.to_string(),
-                        script,
-                        Some(timeout),
-                        CancelToken::default(),
-                        |_| {},
-                    ))
-                    .await?;
-                    let mut text = format!(
-                        "The script ran on {db} (db is now {}).\nResult (relaxed Extended JSON):\n{}",
-                        result.database,
-                        serde_json::to_string_pretty(&result.value).unwrap_or_default()
-                    );
-                    if !result.logs.is_empty() {
-                        text.push_str(&format!("\nPrinted:\n{}", result.logs.join("\n")));
-                    }
-                    Ok(Done {
-                        text,
-                        meta: format!(
-                            "{} printed",
-                            plural(result.logs.len() as u64, "line", "lines")
-                        ),
+                    let run = run_script(call, client, db, args, None);
+                    let outcome = timed!(async { Ok(run.await) }).await?;
+                    outcome.result.map(|ran| Done {
+                        meta: ran.meta(),
+                        text: ran.text(db),
                     })
                 }
                 _ => unreachable!("handled above"),
             }
         }
     }
+}
+
+/// A document write's dry run: what the plan counted, and for inserts
+/// the documents that would clash.
+async fn dry_run_only(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &Value,
+    tool: Tool,
+    plan: &Plan,
+) -> AppResult<Done> {
+    let counted = plan.dry_run.clone().unwrap_or_default();
+    let mut text = format!("Dry run: nothing was written. {counted}.");
+    if tool == Tool::InsertDocuments {
+        let docs: Vec<Document> = documents_of(args)?
+            .into_iter()
+            .map(json_to_document)
+            .collect::<AppResult<_>>()?;
+        let problems = documents::insert_problems(client, db, coll, &docs).await?;
+        if problems.is_empty() {
+            text.push_str(" No _id or unique index clashes were found.");
+        } else {
+            text.push_str(&format!(
+                "\nThese would fail (documents numbered from 0):\n- {}",
+                problems.join("\n- ")
+            ));
+        }
+    }
+    Ok(Done {
+        text,
+        meta: format!("dry run · {counted}"),
+    })
 }
 
 type BoxedOp<'a, T> =
@@ -1517,13 +2206,17 @@ fn find<'a>(
 ) -> BoxedOp<'a, Done> {
     Box::pin(async move {
         let limit = int_arg(args, "limit", DEFAULT_DOCS, MAX_DOCS);
-        let skip = args.get("skip").and_then(Value::as_u64).unwrap_or(0);
+        let skip = skip_of(args);
         let c = collection(client, db, coll);
         let mut find = c
             .find(doc_of(args, "filter")?)
             .limit(limit)
             .skip(skip)
-            .max_time(MAX_TIME);
+            .max_time(read_time(args))
+            .optional(hint_of(args)?, |f, h| f.hint(h));
+        if bool_of(args, "allow_disk_use") {
+            find = find.allow_disk_use(true);
+        }
         if let Some(projection) = opt_doc_of(args, "projection")? {
             find = find.projection(projection);
         }
@@ -1570,7 +2263,15 @@ fn aggregate<'a>(
         let started = Instant::now();
         let mut docs: Vec<Document> = collection(client, db, coll)
             .aggregate(stages)
-            .max_time(if writes { OP_TIMEOUT } else { MAX_TIME })
+            .max_time(if writes {
+                read_time(args).max(OP_TIMEOUT)
+            } else {
+                read_time(args)
+            })
+            .optional(hint_of(args)?, |a, h| a.hint(h))
+            .optional(bool_of(args, "allow_disk_use").then_some(true), |a, v| {
+                a.allow_disk_use(v)
+            })
             .await?
             .try_collect()
             .await?;
@@ -1613,8 +2314,8 @@ fn explain<'a>(
     args: &'a Value,
 ) -> BoxedOp<'a, Done> {
     Box::pin(async move {
-        let max_time_ms = MAX_TIME.as_millis() as i64;
-        let command = match json_of(args, "pipeline")? {
+        let max_time_ms = read_time(args).as_millis() as i64;
+        let mut command = match json_of(args, "pipeline")? {
             Some(Value::Array(stages)) => {
                 doc! { "aggregate": coll, "pipeline": stages_of(stages)?, "cursor": {}, "maxTimeMS": max_time_ms }
             }
@@ -1628,6 +2329,12 @@ fn explain<'a>(
                 command
             }
         };
+        if let Some(hint) = hint_of(args)? {
+            command.insert("hint", hint_bson(hint));
+        }
+        if bool_of(args, "allow_disk_use") && command.contains_key("aggregate") {
+            command.insert("allowDiskUse", true);
+        }
         let result = client
             .database(db)
             .run_command(doc! { "explain": command, "verbosity": "executionStats" })
@@ -1638,6 +2345,56 @@ fn explain<'a>(
             meta: summary.meta,
         })
     })
+}
+
+/// get_history: the history, as far as the client may read it.
+fn get_history(call: &Call<'_>, args: &Value) -> AppResult<Done> {
+    let config = call.inner.config();
+    let since = match str_arg(args, "since") {
+        None => None,
+        Some(text) => Some(parse_since(&text)?),
+    };
+    let limit = int_arg(args, "limit", DEFAULT_HISTORY, MAX_HISTORY) as usize;
+    let readable = |id: &String| policy::level_of(&config, id) >= Level::Read;
+    let entries: Vec<HistoryEntry> = call
+        .inner
+        .history
+        .list(&HistoryFilter {
+            connection_id: str_arg(args, "connection_id"),
+            since,
+            limit: None,
+        })?
+        .into_iter()
+        .filter(|e| {
+            e.connection_id.as_ref().is_none_or(readable) && e.connection_ids.iter().all(readable)
+        })
+        .take(limit)
+        .collect();
+    let n = plural(entries.len() as u64, "entry", "entries");
+    let mut text = match str_arg(args, "format").as_deref() {
+        Some("json") => history::json(&entries),
+        _ => history::markdown(&entries),
+    };
+    if !config.history {
+        text.insert_str(
+            0,
+            "(The user has turned the history off in Mongo Studio: new calls aren't kept.)\n\n",
+        );
+    }
+    Ok(Done { text, meta: n })
+}
+
+/// A date (`2026-11-16`, from midnight UTC) or an RFC 3339 date-time.
+fn parse_since(text: &str) -> AppResult<u64> {
+    let text = text.trim();
+    let full = if text.len() == 10 {
+        format!("{text}T00:00:00Z")
+    } else {
+        text.to_string()
+    };
+    mongodb::bson::DateTime::parse_rfc3339_str(&full)
+        .map(|d| d.timestamp_millis().max(0) as u64)
+        .map_err(|_| invalid("since must be a date like 2026-11-16 or an ISO date-time."))
 }
 
 // --- Saved connections ---
@@ -1725,7 +2482,9 @@ fn list_connections(inner: &Inner) -> Done {
                 "id": profile.id,
                 "name": profile.name,
                 "folder": folders.get(&profile.id).map(|(_, label)| label.clone()),
+                "environment": profile.environment.map(Environment::id),
                 "hosts": logging::host_summary(&profile),
+                "replicaSet": profile.advanced.replica_set,
                 "database": profile.database,
                 "access": if level == Level::Write { "read & write" } else { "read" },
             }))
@@ -1752,6 +2511,7 @@ struct NewConnection {
     username: Option<String>,
     had_password: bool,
     folder: Option<String>,
+    environment: Option<Environment>,
 }
 
 fn checked_uri(uri: &str) -> AppResult<(String, Option<String>, bool)> {
@@ -1783,7 +2543,41 @@ fn new_connection_args(args: &Value) -> AppResult<NewConnection> {
         username,
         had_password,
         folder: str_arg(args, "folder"),
+        environment: environment_arg(args)?.flatten(),
     })
+}
+
+/// A client may mark a connection production, never unmark it.
+fn check_environment_change(
+    current: Option<Environment>,
+    change: Option<Option<Environment>>,
+) -> AppResult<()> {
+    match change {
+        Some(new)
+            if current == Some(Environment::Production) && new != Some(Environment::Production) =>
+        {
+            Err(invalid(
+                "This connection is marked production, and only the user can change that, in \
+                 Mongo Studio.",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `environment`: absent (`None`), cleared (`Some(None)`) or set.
+fn environment_arg(args: &Value) -> AppResult<Option<Option<Environment>>> {
+    match args.get("environment") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("none") => {
+            Ok(Some(None))
+        }
+        Some(Value::String(s)) => Environment::parse(s).map(|e| Some(Some(e))).ok_or_else(|| {
+            invalid("environment must be development, testing, staging, production or none.")
+        }),
+        Some(_) => Err(invalid("environment must be a string.")),
+    }
 }
 
 struct ConnectionChange {
@@ -1791,6 +2585,7 @@ struct ConnectionChange {
     uri: Option<String>,
     username: Option<String>,
     had_password: bool,
+    environment: Option<Option<Environment>>,
 }
 
 fn connection_change_args(args: &Value) -> AppResult<ConnectionChange> {
@@ -1802,14 +2597,16 @@ fn connection_change_args(args: &Value) -> AppResult<ConnectionChange> {
         }
         None => (None, None, false),
     };
-    if name.is_none() && uri.is_none() {
-        return Err(invalid("Pass a new name, a new uri, or both."));
+    let environment = environment_arg(args)?;
+    if name.is_none() && uri.is_none() && environment.is_none() {
+        return Err(invalid("Pass a new name, uri or environment."));
     }
     Ok(ConnectionChange {
         name,
         uri,
         username,
         had_password,
+        environment,
     })
 }
 
@@ -1838,6 +2635,7 @@ fn create_connection(call: &Call<'_>, args: &Value) -> AppResult<Done> {
         id: String::new(),
         name: new.name.clone(),
         color: None,
+        environment: new.environment,
         source: ConnectionSource::Uri { uri: new.uri },
         database: None,
         username: new.username.clone(),
@@ -1907,6 +2705,10 @@ async fn update_connection(call: &Call<'_>, args: &Value) -> AppResult<Done> {
     let mut notes = Vec::new();
     if let Some(name) = &change.name {
         profile.name = name.clone();
+    }
+    check_environment_change(profile.environment, change.environment)?;
+    if let Some(environment) = change.environment {
+        profile.environment = environment;
     }
     if let Some(uri) = change.uri {
         profile.source = ConnectionSource::Uri { uri };
@@ -2113,6 +2915,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: uri.to_string(),
             },
@@ -2138,6 +2941,8 @@ mod tests {
                 .collect(),
             always: HashMap::new(),
             alerts: Default::default(),
+            confirm_production: true,
+            history: true,
         }
     }
 
@@ -2171,7 +2976,9 @@ mod tests {
                 "list_databases",
                 "list_collections",
                 "list_indexes",
-                "sample_schema"
+                "sample_schema",
+                "get_task",
+                "cancel_task"
             ]
         );
         let more = names(&config(
@@ -2189,6 +2996,47 @@ mod tests {
         assert!(!more.contains(&"save_script".to_string()));
         assert!(!more.contains(&"drop_collection".to_string()));
         assert!(!more.contains(&"run_script".to_string()));
+    }
+
+    #[test]
+    fn numbers_and_booleans_sent_as_strings_are_read() {
+        let args = json!({ "timeout_ms": "120000", "skip": "40", "many": "true", "upsert": false });
+        assert_eq!(script_timeout(&args), 120_000);
+        assert_eq!(skip_of(&args), 40);
+        assert!(bool_of(&args, "many"));
+        assert!(!bool_of(&args, "upsert"));
+        assert_eq!(script_timeout(&json!({ "timeout_ms": 90000.0 })), 90_000);
+        assert_eq!(
+            script_timeout(&json!({ "timeout_ms": "soon" })),
+            DEFAULT_SCRIPT_MS
+        );
+        assert_eq!(
+            script_timeout(&json!({ "timeout_ms": "999999" })),
+            MAX_SCRIPT_MS
+        );
+        assert_eq!(skip_of(&json!({ "skip": -3 })), 0);
+    }
+
+    #[test]
+    fn lost_connections_are_told_from_other_errors() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(lost_connection(&AppError::Io(reset)));
+        assert!(lost_connection(&AppError::InvalidInput(
+            "database error: Kind: I/O error: An existing connection was forcibly closed by the remote host. (os error 10054)".into()
+        )));
+        assert!(lost_connection(&AppError::InvalidInput(
+            "Server selection timeout: No available servers. Topology: { Type: Unknown }".into()
+        )));
+        assert!(!lost_connection(&AppError::InvalidInput(
+            "ReferenceError: x is not defined".into()
+        )));
+        // a script's own error that only sounds like one
+        assert!(!lost_connection(&AppError::InvalidInput(
+            "Error: connection refused by the API".into()
+        )));
+        assert!(!lost_connection(&AppError::NotFound(
+            "no such connection".into()
+        )));
     }
 
     #[test]
@@ -2478,6 +3326,237 @@ mod tests {
         assert_eq!(last_activity(&host)["label"], "Not answered");
     }
 
+    /// A request nobody answers within inline_wait comes back as a task
+    /// that says it waits for the user; the answer arrives via get_task.
+    #[tokio::test]
+    async fn a_call_waiting_for_approval_goes_on_as_a_task() {
+        let (host, mut inner) = inner(Duration::from_secs(5));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(50));
+        set_policy(&inner, config(&[("saveScript", Policy::Ask)], &[]));
+        let args = json!({ "name": "report", "content": "db.orders.find()" });
+        let out = run(&inner, "save_script", args.clone()).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("Waiting for the user to approve this in Mongo Studio"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Don't call save_script again"),
+            "{}",
+            out.text
+        );
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+
+        // Still waiting: get_task says so after its wait.
+        let status = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": "20" }),
+        )
+        .await;
+        assert!(
+            status.text.starts_with("Waiting for the user"),
+            "{}",
+            status.text
+        );
+
+        let request = host.events_named(REQUEST_EVENT).pop().unwrap();
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            super::super::RequestChoice::Once,
+        )
+        .unwrap();
+        let done = run(&inner, "get_task", json!({ "task_id": task_id })).await;
+        assert!(!done.is_error, "{}", done.text);
+        assert!(
+            done.text.contains("(save_script) finished"),
+            "{}",
+            done.text
+        );
+        assert_eq!(host.scripts.list().unwrap().len(), 1);
+
+        // Cancelling withdraws the card and runs nothing.
+        let out = run(&inner, "save_script", args).await;
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let cancelled = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert!(
+            cancelled.text.starts_with("Withdrew the request"),
+            "{}",
+            cancelled.text
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            host.events_named(REQUEST_CLOSED_EVENT).pop().unwrap()["reason"],
+            "cancelled"
+        );
+        assert!(inner.approvals.lock().unwrap().is_empty());
+        let after = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": 0 }),
+        )
+        .await;
+        assert!(
+            after.is_error && after.text.contains("Cancelled"),
+            "{}",
+            after.text
+        );
+        assert_eq!(host.scripts.list().unwrap().len(), 1);
+
+        let unknown = run(&inner, "get_task", json!({ "task_id": "nope" })).await;
+        assert!(unknown.is_error);
+    }
+
+    /// A server that can't be reached is told as a lost connection, with
+    /// what to check; a read is retried once, a write isn't.
+    #[tokio::test]
+    async fn unreachable_servers_say_to_check_the_network() {
+        let (host, inner) = inner(Duration::from_secs(1));
+        host.state
+            .connection_store
+            .upsert(profile(
+                "dead",
+                "Dead",
+                "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+            ))
+            .unwrap();
+        set_policy(
+            &inner,
+            config(
+                &[("read", Policy::Allow), ("write", Policy::Allow)],
+                &[("dead", Level::Write)],
+            ),
+        );
+        let out = run(
+            &inner,
+            "count",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y" }),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.text.starts_with("Lost the connection to \"Dead\""),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Check the VPN or the network"),
+            "{}",
+            out.text
+        );
+        let out = run(
+            &inner,
+            "delete_documents",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y", "filter": {} }),
+        )
+        .await;
+        assert!(out.text.starts_with("Lost the connection"), "{}", out.text);
+    }
+
+    /// A change on a production connection is asked about even when
+    /// allowed, "always" isn't kept, and a client can't take the
+    /// connection out of production.
+    #[tokio::test]
+    async fn production_connections_ask_before_every_change() {
+        let (host, inner) = inner(Duration::from_secs(5));
+        let mut prod = profile("p1", "Billing", "mongodb://db.example:27017");
+        prod.environment = Some(Environment::Production);
+        host.state.connection_store.upsert(prod).unwrap();
+        set_policy(
+            &inner,
+            config(
+                &[("connEdit", Policy::Allow), ("connList", Policy::Allow)],
+                &[("p1", Level::Write)],
+            ),
+        );
+        let out = run(&inner, "list_connections", json!({})).await;
+        assert!(
+            out.text.contains("\"environment\":\"production\""),
+            "{}",
+            out.text
+        );
+
+        let waiting = {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run(
+                    &inner,
+                    "update_connection",
+                    json!({ "connection_id": "p1", "name": "Billing EU" }),
+                )
+                .await
+            })
+        };
+        let request = loop {
+            if let Some(event) = host.events_named(REQUEST_EVENT).pop() {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(request["production"], true);
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            super::super::RequestChoice::Always,
+        )
+        .unwrap();
+        let out = waiting.await.unwrap();
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(last_activity(&host)["label"], "Approved by you");
+        assert!(inner.config().always.is_empty());
+
+        // A client can't unmark it: refused before the user is asked.
+        let out = run(
+            &inner,
+            "update_connection",
+            json!({ "connection_id": "p1", "environment": "development" }),
+        )
+        .await;
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        assert!(
+            out.is_error && out.text.contains("only the user can change that"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            host.state.connection_store.get("p1").unwrap().environment,
+            Some(Environment::Production)
+        );
+    }
+
+    /// A call still connecting says so - not that it waits for the user.
+    #[tokio::test]
+    async fn a_slow_start_is_not_told_as_waiting_for_approval() {
+        let (host, mut inner) = inner(Duration::from_secs(1));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(50));
+        host.state
+            .connection_store
+            .upsert(profile(
+                "dead",
+                "Dead",
+                "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=1500&connectTimeoutMS=1500",
+            ))
+            .unwrap();
+        set_policy(
+            &inner,
+            config(&[("write", Policy::Ask)], &[("dead", Level::Write)]),
+        );
+        let out = run(
+            &inner,
+            "delete_documents",
+            json!({ "connection_id": "dead", "database": "x", "collection": "y", "filter": {} }),
+        )
+        .await;
+        assert!(out.text.starts_with("Still getting ready"), "{}", out.text);
+        assert!(host.events_named(REQUEST_EVENT).is_empty());
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let stopped = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert_eq!(stopped.text, "Stopped it before it ran; nothing ran.");
+    }
+
     #[tokio::test]
     async fn save_script_approved_writes_the_file() {
         let (host, inner) = inner(Duration::from_secs(5));
@@ -2565,6 +3644,8 @@ mod live_tests {
                 connections: HashMap::from([("live".to_string(), Level::Write)]),
                 always: HashMap::new(),
                 alerts: Default::default(),
+                confirm_production: true,
+                history: true,
             },
         );
         (host, inner)
@@ -2723,6 +3804,517 @@ mod live_tests {
         let out = run(&inner, "drop_collection", on(&coll, json!({}))).await;
         assert!(out.text.contains("Dropped the collection"), "{}", out.text);
         assert_eq!(inner.pool.len().await, 1);
+        inner.pool.close_all("test over").await;
+    }
+
+    /// timeout_ms is honored even sent as a string, and stops the query
+    /// in flight, handing back what the script printed.
+    #[tokio::test]
+    #[ignore]
+    async fn live_script_timeout_stops_it_and_keeps_its_output() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let c = format!("db.getCollection('{coll}')");
+        let script = format!(
+            "await {c}.insertMany([{{a:1}},{{a:2}},{{a:3}}]); print('batch 1 done'); \
+             await {c}.find({{ $where: 'sleep(2000) || true' }}); print('never')"
+        );
+        let started = Instant::now();
+        let out = run(
+            &inner,
+            "run_script",
+            json!({ "connection_id": "live", "database": TEST_DB, "script": script, "timeout_ms": "1500" }),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.is_error);
+        assert!(
+            out.text.starts_with("The script was stopped after 1500 ms"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("batch 1 done"), "{}", out.text);
+        assert!(!out.text.contains("never"), "{}", out.text);
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        client
+            .database(TEST_DB)
+            .collection::<Document>(&coll)
+            .drop()
+            .await
+            .unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// A script that outlasts inline_wait goes on in the background, with
+    /// what it printed so far; get_task brings its result, cancel_task
+    /// stops another one.
+    #[tokio::test]
+    #[ignore]
+    async fn live_long_scripts_go_on_as_tasks() {
+        let (host, mut inner) = setup(Duration::from_secs(1));
+        super::super::test_support::set_inline_wait(&mut inner, Duration::from_millis(1000));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let c = format!("db.getCollection('{coll}')");
+        let script = format!(
+            "await {c}.insertMany([{{a:1}},{{a:2}}]); print('inserted'); \
+             const n = (await {c}.find({{ $where: 'sleep(1000) || true' }})).length; print('read ' + n); n"
+        );
+        let args = json!({ "connection_id": "live", "database": TEST_DB, "script": script });
+        let out = run(&inner, "run_script", args.clone()).await;
+        assert!(out.text.starts_with("Still running after"), "{}", out.text);
+        assert!(
+            out.text.contains("Don't call run_script again"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("inserted"), "{}", out.text);
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let done = run(
+            &inner,
+            "get_task",
+            json!({ "task_id": task_id, "wait_ms": 5000 }),
+        )
+        .await;
+        assert!(!done.is_error, "{}", done.text);
+        assert!(done.text.contains("(run_script) finished"), "{}", done.text);
+        assert!(done.text.contains("read 2"), "{}", done.text);
+
+        let out = run(&inner, "run_script", args).await;
+        let task_id = out.text.split('"').nth(1).unwrap().to_string();
+        let stopped = run(&inner, "cancel_task", json!({ "task_id": task_id })).await;
+        assert!(
+            stopped.text.starts_with("Stopped run_script"),
+            "{}",
+            stopped.text
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        // The second run inserted, then was stopped while reading.
+        assert_eq!(c.count_documents(doc! {}).await.unwrap(), 4);
+        c.drop().await.unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// On a read-only connection a script runs with read_only or dry_run;
+    /// without them it's refused with a hint.
+    #[tokio::test]
+    #[ignore]
+    async fn live_read_only_and_dry_run_scripts() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let script = |s: &str| json!({ "connection_id": "live", "database": TEST_DB, "script": s });
+        let out = run(
+            &inner,
+            "run_script",
+            script(&format!("await db.{coll}.insertMany([{{a:1}},{{a:1}}])")),
+        )
+        .await;
+        assert!(out.text.contains("Changed: 2 inserted"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::Read);
+
+        let write = format!("await db.{coll}.updateMany({{a:1}}, {{$set: {{b: new Date()}}}})");
+        let out = run(&inner, "run_script", script(&write)).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("read_only: true"), "{}", out.text);
+
+        let mut args = script(&format!("await db.{coll}.countDocuments({{}})"));
+        args["read_only"] = json!("true");
+        let out = run(&inner, "run_script", args).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.starts_with("The script ran read-only"),
+            "{}",
+            out.text
+        );
+
+        let mut args = script(&write);
+        args["dry_run"] = json!(true);
+        let out = run(&inner, "run_script", args).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("nothing was written"), "{}", out.text);
+        assert!(
+            out.text.contains("2 documents would change"),
+            "{}",
+            out.text
+        );
+
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        assert_eq!(
+            c.count_documents(doc! { "b": { "$exists": true } })
+                .await
+                .unwrap(),
+            0
+        );
+        c.drop().await.unwrap();
+        inner.pool.close_all("test over").await;
+    }
+
+    /// hint, max_time_ms and allow_disk_use reach the server: a hint that
+    /// names no index is the server's error, not ignored.
+    #[tokio::test]
+    #[ignore]
+    async fn live_reads_take_hint_max_time_and_disk_use() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let out = run(&inner, "run_script", json!({ "connection_id": "live", "database": TEST_DB,
+            "script": format!("await db.{coll}.insertMany([{{s: 1}}, {{s: 2}}]); await db.{coll}.createIndex({{ s: 1 }})") })).await;
+        assert!(!out.is_error, "{}", out.text);
+        let out = run(&inner, "find", on(&coll, json!({ "filter": { "s": 1 }, "hint": "s_1", "max_time_ms": "5000", "allow_disk_use": true }))).await;
+        assert!(out.text.starts_with("Returned 1 document"), "{}", out.text);
+        let out = run(&inner, "find", on(&coll, json!({ "hint": "nope_1" }))).await;
+        assert!(out.is_error, "{}", out.text);
+        let out = run(&inner, "count", on(&coll, json!({ "hint": { "s": 1 } }))).await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+        let out = run(&inner, "aggregate", on(&coll, json!({ "pipeline": [{ "$sort": { "s": -1 } }], "allow_disk_use": true, "hint": "{\"s\": 1}" }))).await;
+        assert!(out.text.contains("returned 2 documents"), "{}", out.text);
+        let out = run(
+            &inner,
+            "explain",
+            on(&coll, json!({ "filter": { "s": 2 }, "hint": "s_1" })),
+        )
+        .await;
+        assert!(out.text.contains("s_1"), "{}", out.text);
+        let out = run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        assert!(!out.is_error, "{}", out.text);
+        inner.pool.close_all("test over").await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_upserts_and_insert_dry_runs() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let out = run(&inner, "run_script", json!({ "connection_id": "live", "database": TEST_DB,
+            "script": format!("await db.{coll}.createIndex({{ email: 1 }}, {{ unique: true, sparse: true }}); await db.{coll}.insertOne({{ _id: 1, sub: 'a', product: 'chat', credits: 1, email: 'a@x' }})") })).await;
+        assert!(!out.is_error, "{}", out.text);
+        let docs = json!([
+            { "sub": "a", "product": "chat", "credits": 5 },
+            { "sub": "b", "product": "chat", "credits": 7 },
+        ]);
+
+        let mut args = on(
+            &coll,
+            json!({ "keys": ["sub", "product"], "documents": docs, "only_insert": true, "dry_run": true }),
+        );
+        let out = run(&inner, "upsert_documents", args.clone()).await;
+        assert!(out.text.starts_with("Dry run: nothing was written. 1 document would be inserted; 1 document already exists and would be left as they are"), "{}", out.text);
+        args["dry_run"] = json!(false);
+        let out = run(&inner, "upsert_documents", args).await;
+        assert!(out.text.contains("Inserted 1 document"), "{}", out.text);
+        assert!(out.text.contains("1 already existed"), "{}", out.text);
+
+        let out = run(&inner, "upsert_documents", on(&coll, json!({ "keys": ["sub", "product"], "documents": [{ "sub": "a", "product": "chat", "credits": 9 }] }))).await;
+        assert!(out.text.contains("matched 1 (modified 1)"), "{}", out.text);
+        let out = run(
+            &inner,
+            "count",
+            on(&coll, json!({ "filter": { "credits": { "$in": [9, 7] } } })),
+        )
+        .await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+
+        let out = run(
+            &inner,
+            "insert_documents",
+            on(
+                &coll,
+                json!({ "dry_run": true, "documents": [
+            { "_id": 1 }, { "_id": 2, "email": "a@x" }, { "_id": 3, "email": "n@x" }, { "_id": 3 }
+        ] }),
+            ),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("4 documents would be inserted"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("1 document has an _id that the collection already has: #0"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("repeats an _id of an earlier document in the list: #3"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("unique index email_1 (email) that the collection already has: #1"),
+            "{}",
+            out.text
+        );
+        let out = run(&inner, "count", on(&coll, json!({}))).await;
+        assert!(out.text.starts_with("2 documents"), "{}", out.text);
+        run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        inner.pool.close_all("test over").await;
+    }
+
+    /// One script on two connections: one approval, a result per
+    /// connection, "always" kept for both.
+    #[tokio::test]
+    #[ignore]
+    async fn live_one_script_on_several_connections() {
+        let (host, inner) = setup(Duration::from_secs(5));
+        let second = std::env::var("MONGO_STUDIO_TEST_URI_2")
+            .unwrap_or_else(|_| "mongodb://localhost:27018".into());
+        host.state
+            .connection_store
+            .upsert(profile("live2", "Live 2", &second))
+            .unwrap();
+        {
+            let mut config = inner.config.lock().unwrap();
+            config.connections.insert("live2".into(), Level::Write);
+            config.caps.insert("script".into(), Policy::Ask);
+        }
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let args = json!({ "connection_ids": ["live", "live2"], "database": TEST_DB,
+            "script": format!("await db.{coll}.insertOne({{ at: new Date() }}); print('on ' + db.getName()); await db.{coll}.countDocuments({{}})") });
+        let waiting = {
+            let inner = inner.clone();
+            let args = args.clone();
+            tokio::spawn(async move { run(&inner, "run_script_on_connections", args).await })
+        };
+        let request = loop {
+            if let Some(event) = host.events_named(REQUEST_EVENT).pop() {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(request["connectionName"], "Live, Live 2");
+        assert_eq!(
+            request["title"],
+            format!("Run a script on 2 connections ({TEST_DB})")
+        );
+        policy::answer(
+            &inner,
+            request["requestId"].as_str().unwrap(),
+            RequestChoice::Always,
+        )
+        .unwrap();
+        let out = waiting.await.unwrap();
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.starts_with(&format!(
+                "Ran the script on {TEST_DB} on 2 of 2 connections. Changed in all: 2 inserted."
+            )),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("## Live (live)") && out.text.contains("## Live 2 (live2)"),
+            "{}",
+            out.text
+        );
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        let always = &inner.config().always;
+        assert!(
+            always["live"].contains(&"script".to_string())
+                && always["live2"].contains(&"script".to_string())
+        );
+
+        // Now allowed for both without asking; a read-only connection refuses it.
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live2".into(), Level::Read);
+        let out = run(&inner, "run_script_on_connections", args.clone()).await;
+        assert!(
+            out.is_error && out.text.contains("On Live 2") && out.text.contains("read_only: true"),
+            "{}",
+            out.text
+        );
+        let mut read = args;
+        read["script"] = json!(format!("await db.{coll}.drop()"));
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live2".into(), Level::Write);
+        let out = run(&inner, "run_script_on_connections", read).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(host.events_named(REQUEST_EVENT).len(), 1);
+        inner.pool.close_all("test over").await;
+    }
+
+    /// Writes and scripts that ran are kept with their code; reads and
+    /// refusals aren't; get_history hands them back as Markdown.
+    #[tokio::test]
+    #[ignore]
+    async fn live_history_keeps_what_ran() {
+        let (_host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        run(
+            &inner,
+            "insert_documents",
+            on(&coll, json!({ "documents": [{ "a": 1 }] })),
+        )
+        .await;
+        run(&inner, "find", on(&coll, json!({}))).await;
+        run(
+            &inner,
+            "run_script",
+            json!({ "connection_id": "live", "database": TEST_DB, "read_only": true,
+            "script": format!("await db.{coll}.countDocuments({{}})") }),
+        )
+        .await;
+        run(
+            &inner,
+            "update_documents",
+            on(
+                &coll,
+                json!({ "filter": { "a": 1 }, "update": { "$set": { "b": 2 } } }),
+            ),
+        )
+        .await;
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .caps
+            .insert("write".into(), Policy::Off);
+        run(
+            &inner,
+            "delete_documents",
+            on(&coll, json!({ "filter": {} })),
+        )
+        .await;
+
+        let entries = inner.history.list(&HistoryFilter::default()).unwrap();
+        let tools: Vec<&str> = entries.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(
+            tools,
+            ["update_documents", "run_script", "insert_documents"]
+        );
+        assert!(
+            entries[0].code.contains("updateOne({\"a\":1}"),
+            "{:?}",
+            entries[0]
+        );
+        assert_eq!(entries[0].summary, "1 document modified");
+        assert_eq!(entries[0].connection_name.as_deref(), Some("Live"));
+
+        let out = run(
+            &inner,
+            "get_history",
+            json!({ "limit": 2, "since": "2020-01-01" }),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("# Changes made through Mongo Studio's MCP server\n\n2 calls"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("run_script"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::None);
+        let out = run(&inner, "get_history", json!({})).await;
+        assert!(out.text.contains("Nothing recorded"), "{}", out.text);
+        inner
+            .config
+            .lock()
+            .unwrap()
+            .connections
+            .insert("live".into(), Level::Write);
+        run(&inner, "drop_collection", on(&coll, json!({}))).await;
+        inner.pool.close_all("test over").await;
+    }
+
+    /// A client the user disconnects has its calls stopped, also those
+    /// still inside the first 40 seconds.
+    #[tokio::test]
+    #[ignore]
+    async fn live_disconnecting_a_client_stops_its_calls() {
+        let (host, inner) = setup(Duration::from_secs(1));
+        let coll = format!("mcp_{}", uuid::Uuid::new_v4().simple());
+        let script = format!("await sleep(800); await db.{coll}.insertOne({{ a: 1 }})");
+        let running = {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run(
+                    &inner,
+                    "run_script",
+                    json!({ "connection_id": "live", "database": TEST_DB, "script": script }),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(inner.forget_session("s1"));
+        let out = running.await.unwrap();
+        assert!(out.text.starts_with("Cancelled"), "{}", out.text);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let client = inner
+            .pool
+            .client(
+                host.as_ref(),
+                &profile(
+                    "live",
+                    "Live",
+                    &std::env::var("MONGO_STUDIO_TEST_URI").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        let c = client.database(TEST_DB).collection::<Document>(&coll);
+        assert_eq!(c.count_documents(doc! {}).await.unwrap(), 0);
         inner.pool.close_all("test over").await;
     }
 

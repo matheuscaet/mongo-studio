@@ -7,6 +7,8 @@ mod feed;
 mod install;
 mod script;
 
+pub(crate) use script::describe_ms;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -310,6 +312,7 @@ mod tests {
                 id: "p".to_string(),
                 name: "p".to_string(),
                 color: None,
+                environment: None,
                 source,
                 database: None,
                 username: None,
@@ -479,6 +482,7 @@ mod live_tests {
             id: "live-mongosh".to_string(),
             name: "live mongosh".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: base },
             database: None,
             username: None,

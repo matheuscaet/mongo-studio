@@ -1,5 +1,6 @@
 mod assistant;
 mod attention;
+mod bulk;
 mod commands;
 mod connection;
 mod connections_io;
@@ -99,6 +100,10 @@ pub fn run() {
             commands::mcp_token,
             commands::mcp_regenerate_token,
             commands::mcp_answer,
+            commands::mcp_history,
+            commands::mcp_history_count,
+            commands::mcp_history_clear,
+            commands::mcp_history_export,
             commands::mcp_disconnect_client,
             commands::mcp_client_targets,
             commands::mcp_register_client,

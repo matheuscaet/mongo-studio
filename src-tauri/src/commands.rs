@@ -16,7 +16,9 @@ use crate::error::{AppError, AppResult};
 use crate::export;
 use crate::field_edit;
 use crate::logging::{self, logged, Op};
-use crate::mcp_server::{ClientTarget, McpConfig, McpServer, McpStatus, RequestChoice};
+use crate::mcp_server::{
+    ClientTarget, HistoryEntry, HistoryFilter, McpConfig, McpServer, McpStatus, RequestChoice,
+};
 use crate::models::{
     validate_color, CollectionInfo, CollectionStats, ConnectionAdvancedOptions, ConnectionHandle,
     ConnectionImportPreview, ConnectionProfile, ConnectionProfileInput, ConnectionProfileMeta,
@@ -121,6 +123,7 @@ async fn materialize_profile(
         id,
         name: input.name,
         color: input.color,
+        environment: input.environment,
         source,
         database: input.database,
         username,
@@ -344,6 +347,7 @@ async fn import_file(
             id: None,
             name: entry.name,
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: entry.uri },
             database: None,
             username: entry.username,
@@ -986,6 +990,27 @@ pub async fn mcp_unregister_client(
 }
 
 #[tauri::command]
+pub fn mcp_history(mcp: State<McpServer>, filter: HistoryFilter) -> AppResult<Vec<HistoryEntry>> {
+    logged("mcp_history", mcp.history(&filter))
+}
+
+#[tauri::command]
+pub fn mcp_history_count(mcp: State<McpServer>) -> AppResult<usize> {
+    logged("mcp_history_count", mcp.history_count())
+}
+
+#[tauri::command]
+pub fn mcp_history_clear(mcp: State<McpServer>) -> AppResult<()> {
+    logged("mcp_history_clear", mcp.clear_history())
+}
+
+/// Writes the history to `path`, as Markdown or JSON (`format`).
+#[tauri::command]
+pub fn mcp_history_export(mcp: State<McpServer>, path: String, format: String) -> AppResult<usize> {
+    logged("mcp_history_export", mcp.export_history(&path, &format))
+}
+
+#[tauri::command]
 pub fn cancel_script(state: State<AppState>, execution_id: String) {
     cancel_task(&state, &execution_id);
 }
@@ -1262,6 +1287,7 @@ mod tests {
             id,
             name: name.to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200"
                     .to_string(),

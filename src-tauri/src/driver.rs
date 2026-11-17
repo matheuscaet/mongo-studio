@@ -647,57 +647,6 @@ pub async fn count_documents(
         .await?)
 }
 
-pub async fn insert_one(
-    client: &Client,
-    db: &str,
-    collection: &str,
-    document: serde_json::Value,
-) -> AppResult<serde_json::Value> {
-    let document = json_to_document(document)?;
-    let result = client
-        .database(db)
-        .collection::<Document>(collection)
-        .insert_one(document)
-        .await?;
-    Ok(bson_to_json(result.inserted_id))
-}
-
-pub async fn update_one(
-    client: &Client,
-    db: &str,
-    collection: &str,
-    filter: serde_json::Value,
-    update: serde_json::Value,
-) -> AppResult<serde_json::Value> {
-    let filter = json_to_document(filter)?;
-    let update = json_to_document(update)?;
-    let result = client
-        .database(db)
-        .collection::<Document>(collection)
-        .update_one(filter, update)
-        .await?;
-    Ok(serde_json::json!({
-        "matchedCount": result.matched_count,
-        "modifiedCount": result.modified_count,
-        "upsertedId": result.upserted_id.map(bson_to_json),
-    }))
-}
-
-pub async fn delete_one(
-    client: &Client,
-    db: &str,
-    collection: &str,
-    filter: serde_json::Value,
-) -> AppResult<serde_json::Value> {
-    let filter = json_to_document(filter)?;
-    let result = client
-        .database(db)
-        .collection::<Document>(collection)
-        .delete_one(filter)
-        .await?;
-    Ok(serde_json::json!({ "deletedCount": result.deleted_count }))
-}
-
 /// Deletes the documents with these `_id`s (Extended JSON); returns how many
 /// went. Fewer than asked means some were already gone.
 pub async fn delete_documents(
@@ -750,27 +699,6 @@ pub async fn insert_many(
     Ok(serde_json::json!({
         "insertedCount": inserted_ids.len(),
         "insertedIds": inserted_ids,
-    }))
-}
-
-pub async fn update_many(
-    client: &Client,
-    db: &str,
-    collection: &str,
-    filter: serde_json::Value,
-    update: serde_json::Value,
-) -> AppResult<serde_json::Value> {
-    let filter = json_to_document(filter)?;
-    let update = json_to_document(update)?;
-    let result = client
-        .database(db)
-        .collection::<Document>(collection)
-        .update_many(filter, update)
-        .await?;
-    Ok(serde_json::json!({
-        "matchedCount": result.matched_count,
-        "modifiedCount": result.modified_count,
-        "upsertedId": result.upserted_id.map(bson_to_json),
     }))
 }
 
@@ -924,6 +852,7 @@ mod tests {
             id: "conn".to_string(),
             name: "test".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri {
                 uri: "mongodb://localhost:27017/".to_string(),
             },
@@ -1074,6 +1003,7 @@ mod live_tests {
             id: profile_id,
             name: "live test".to_string(),
             color: None,
+            environment: None,
             source: ConnectionSource::Uri { uri: stripped_uri },
             database: None,
             username,
